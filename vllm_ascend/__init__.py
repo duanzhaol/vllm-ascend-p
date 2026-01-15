@@ -30,6 +30,8 @@ def register_connector():
 def register_model_loader():
     from .model_loader.netloader import register_netloader
     register_netloader()
+    # Register sharded_state loader with multi-thread support
+    from .model_loader.sharded_state_loader import AscendShardedStateLoader  # noqa
 
 
 def register_service_profiling():

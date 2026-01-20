@@ -19,7 +19,54 @@ from typing import Callable, Optional
 import torch
 import torch_npu
 
+import vllm.envs as envs
+from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.routing_simulator import \
+    RoutingSimulator
 from vllm_ascend.utils import get_weight_prefetch_method
+
+logger = init_logger(__name__)
+
+# --- Expert Statistics Globals ---
+_EXPERT_STATS_CALL_COUNT = 0
+_EXPERT_STATS_COUNTS = {}
+_EXPERT_STATS_LOG_INTERVAL = 100  # Log statistics every 100 calls
+
+def _log_expert_distribution(topk_ids: torch.Tensor):
+    """
+    Accumulates and logs the distribution of selected experts.
+    Designed to work safely with --enforce-eager.
+    """
+    global _EXPERT_STATS_CALL_COUNT, _EXPERT_STATS_COUNTS
+    
+    _EXPERT_STATS_CALL_COUNT += 1
+    
+    try:
+        # NOTE: .tolist() forces a device-host sync. 
+        # This is safe ONLY because graph capture is disabled (--enforce-eager).
+        # In graph mode, this block should be skipped or wrapped to avoid crashes.
+        flat_ids = topk_ids.flatten().tolist()
+        
+        for eid in flat_ids:
+            _EXPERT_STATS_COUNTS[eid] = _EXPERT_STATS_COUNTS.get(eid, 0) + 1
+            
+        if _EXPERT_STATS_CALL_COUNT % _EXPERT_STATS_LOG_INTERVAL == 0:
+            total_selections = sum(_EXPERT_STATS_COUNTS.values())
+            sorted_stats = sorted(_EXPERT_STATS_COUNTS.items())
+            
+            # Format stats for logging
+            stats_str = ", ".join([f"{k}:{v}" for k, v in sorted_stats])
+            
+            msg = (f"[ExpertStats] Steps: {_EXPERT_STATS_CALL_COUNT}, "
+                   f"Total Selections: {total_selections}. "
+                   f"Counts (ExpertID:Count): {{{stats_str}}}")
+            
+            logger.info(msg)
+            print(msg, flush=True) # Ensure visibility
+            
+    except Exception as e:
+        # Silently ignore errors (e.g., if graph mode is enabled later)
+        pass
 
 
 def select_experts(hidden_states: torch.Tensor,
@@ -56,6 +103,38 @@ def select_experts(hidden_states: torch.Tensor,
         topk_weights: router weights of shape (num_tokens, top_k).
         topk_ids: selected expert IDs of shape (num_tokens, top_k).
     """
+    # Check if we should use a routing simulation strategy
+    routing_strategy = envs.VLLM_MOE_ROUTING_SIMULATION_STRATEGY
+    
+    # # Debug print to confirm execution and env var visibility
+    # if routing_strategy:
+    #     # Use simple print as fallback if logger is configured to hide INFO
+    #     print(f"[ExpertsSelector] Routing Strategy: {routing_strategy}", flush=True)
+
+    if routing_strategy != "":
+        current_indices_type = indices_type if indices_type is not None else torch.int32
+        
+        topk_weights, topk_ids = RoutingSimulator.simulate_routing(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            strategy_name=routing_strategy,
+            top_k=top_k,
+            indices_type=current_indices_type,
+        )
+
+        # Log the selected experts. 
+        # CAUTION: .tolist() forces a sync from Device to Host. 
+        # This works ONLY because --enforce-eager is set. 
+        # In Graph mode, this will crash the worker.
+        try:
+            # Update cumulative statistics
+            _log_expert_distribution(topk_ids)
+            
+        except Exception as e:
+            logger.warning(f"Failed to log expert IDs: {e}")
+            
+        return topk_weights, topk_ids
+
     # prefetch w1_w3_proj.weight preprocess
     weight_prefetch_method = get_weight_prefetch_method()
     if weight_prefetch_method:
@@ -96,6 +175,10 @@ def select_experts(hidden_states: torch.Tensor,
             e_score_correction_bias=e_score_correction_bias,
             global_num_experts=global_num_experts,
         )
+        
+    # Update cumulative statistics
+    _log_expert_distribution(topk_ids)
+    
     return topk_weights, topk_ids
 
 

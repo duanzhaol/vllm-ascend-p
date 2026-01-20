@@ -28,6 +28,7 @@ import vllm_ascend.patch.worker.patch_deepseek  # noqa
 import vllm_ascend.patch.worker.patch_weight_loader  # noqa
 import vllm_ascend.patch.worker.patch_multimodal_merge  # noqa
 import vllm_ascend.patch.worker.patch_minicpm  # noqa
+import vllm_ascend.patch.worker.patch_kv_transfer  # noqa
 import vllm_ascend.patch.worker.patch_rope  # noqa
 import vllm_ascend.patch.worker.patch_qwen3_next  # noqa
 import vllm_ascend.patch.worker.patch_qwen3_next_mtp  # noqa

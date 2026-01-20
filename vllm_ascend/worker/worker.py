@@ -198,6 +198,7 @@ class NPUWorker(WorkerBase):
                          num_cpu_blocks: int) -> None:
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
+        ensure_kv_transfer_initialized(self.vllm_config, self.cache_config)
 
     def _init_device(self):
         device = torch.device(f"npu:{self.local_rank}")

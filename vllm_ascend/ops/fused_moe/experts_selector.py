@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 from typing import Callable, Optional
+import os
 
 import torch
 import torch_npu
@@ -37,6 +38,10 @@ def _log_expert_distribution(topk_ids: torch.Tensor):
     Accumulates and logs the distribution of selected experts.
     Designed to work safely with --enforce-eager.
     """
+    # Check if logging is enabled via env var to prevent graph capture hangs and perf/sync issues
+    if os.environ.get("VLLM_MOE_LOG_EXPERT_STATS", "0") != "1":
+        return
+
     global _EXPERT_STATS_CALL_COUNT, _EXPERT_STATS_COUNTS
     
     _EXPERT_STATS_CALL_COUNT += 1
@@ -114,13 +119,39 @@ def select_experts(hidden_states: torch.Tensor,
     if routing_strategy != "":
         current_indices_type = indices_type if indices_type is not None else torch.int32
         
-        topk_weights, topk_ids = RoutingSimulator.simulate_routing(
-            hidden_states=hidden_states,
-            router_logits=router_logits,
-            strategy_name=routing_strategy,
-            top_k=top_k,
-            indices_type=current_indices_type,
-        )
+        # Use deterministic random generation for uniform_random strategy to avoid 
+        # inconsistencies during ACL graph capture (Warmup vs Capture passes).
+        if routing_strategy == "uniform_random":
+            logger.warning_once("[ExpertsSelector] using deterministic uniform_random for Ascend Graph stability.")
+            num_tokens = hidden_states.shape[0]
+            num_experts = router_logits.shape[-1]
+            
+            # Generate deterministic indices directly on device to avoid host<->device copy during capture
+            # and avoid modifying global NPU RNG state.
+            
+            # Create a sequence on device: [0, 1, ..., N*K-1]
+            total_elements = num_tokens * top_k
+            idx_seq = torch.arange(total_elements, device=hidden_states.device, dtype=current_indices_type)
+            
+            # Simple pseudo-random hash: (idx * large_prime + seed) % num_experts
+            # This ensures (1) Determinism (2) Device-only execution (3) Valid distribution
+            # Use int64 for calculation to avoid overflow with large batches, then cast back.
+            topk_ids_flat = ((idx_seq.to(torch.int64) * 7919 + 42) % num_experts).to(current_indices_type)
+            topk_ids = topk_ids_flat.view(num_tokens, top_k)
+            
+            topk_weights = torch.ones(
+                (num_tokens, top_k),
+                dtype=torch.float32,
+                device=hidden_states.device
+            )
+        else:
+            topk_weights, topk_ids = RoutingSimulator.simulate_routing(
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                strategy_name=routing_strategy,
+                top_k=top_k,
+                indices_type=current_indices_type,
+            )
 
         # Log the selected experts. 
         # CAUTION: .tolist() forces a sync from Device to Host. 

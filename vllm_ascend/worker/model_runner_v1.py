@@ -1521,6 +1521,88 @@ class NPUModelRunner(GPUModelRunner):
             self.kv_connector_output = kv_connector_output
         return None
 
+    @torch.inference_mode()
+    def execute_forward_only(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> float:
+        """
+        Execute forward pass only (no sampling) and return elapsed time in ms.
+        Uses NPU Event for precise timing.
+
+        Args:
+            scheduler_output: The scheduler output containing batch information.
+
+        Returns:
+            Elapsed time in milliseconds for the forward pass.
+        """
+        import torch_npu
+
+        # Skip if no tokens to process
+        if not scheduler_output.total_num_scheduled_tokens:
+            return 0.0
+
+        # Prepare inputs (same as execute_model)
+        self._update_states(scheduler_output)
+
+        (attn_metadata, positions, num_scheduled_tokens_np,
+         num_input_tokens, num_tokens_across_dp, maybe_padded_num_tokens,
+         logits_indices, spec_decode_metadata, input_ids, inputs_embeds,
+         intermediate_tensors,
+         max_query_len) = self._prepare_inputs(scheduler_output, None)
+
+        # Determine execution mode
+        num_reqs = self.input_batch.num_reqs
+        tokens = [scheduler_output.num_scheduled_tokens[i]
+                  for i in self.input_batch.req_ids]
+        num_scheduled_tokens = np.array(tokens, dtype=np.int32)
+        num_valid_tokens = num_scheduled_tokens
+
+        uniform_decode = (max_query_len == self.uniform_decode_query_len) and (
+            scheduler_output.total_num_scheduled_tokens
+            == self.input_batch.num_reqs * max_query_len)
+        has_lora = len(self.input_batch.lora_id_to_lora_request) > 0
+        aclgraph_runtime_mode, batch_descriptor = \
+            self.cudagraph_dispatcher.dispatch(
+                num_tokens=num_input_tokens,
+                uniform_decode=uniform_decode,
+                has_lora=has_lora)
+
+        # Create NPU events for timing
+        start_event = torch_npu.npu.Event(enable_timing=True)
+        end_event = torch_npu.npu.Event(enable_timing=True)
+
+        # Synchronize before recording start to avoid measuring previous kernels
+        torch_npu.npu.synchronize()
+
+        # Record start
+        start_event.record()
+
+        # Execute forward pass only (no sampling)
+        with set_ascend_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                aclgraph_runtime_mode=aclgraph_runtime_mode,
+                batch_descriptor=batch_descriptor,
+                num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+                model_instance=self.model):
+            self.maybe_setup_kv_connector(scheduler_output)
+
+            hidden_states = self._generate_process_reqs_hidden_states(
+                maybe_padded_num_tokens, input_ids, positions,
+                intermediate_tensors, inputs_embeds)
+
+        # Record end
+        end_event.record()
+
+        # Synchronize and get elapsed time
+        end_event.synchronize()
+        elapsed_ms = start_event.elapsed_time(end_event)
+
+        return elapsed_ms
+
     @torch.inference_mode
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"

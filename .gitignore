@@ -1,3 +1,5 @@
+*.csv
+config*.json
 ## vLLM Ascend Ignore
 # VSCode
 .vscode/

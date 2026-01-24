@@ -1,0 +1,51 @@
+# vllm-ascend Profiling 配置文件
+# 用于定义性能测试的参数边界
+
+# 基础配置
+block_size: 32                # KV cache block size
+max_model_len: 32768          # 模型最大序列长度
+max_num_seqs: 1024            # 最大并发序列数
+num_gpu_blocks: 11682         # NPU上的KV cache blocks数量
+token_budget: 2048            # 每次迭代的token预算
+
+# 并发配置
+# PP=1 + async_scheduling: max_concurrent_batches = 2
+# PP>1: max_concurrent_batches = PP_size
+max_concurrent_batches: 2     # 最大并发批次数
+
+# 说明:
+# - batch_size (N): 请求数量，1 ~ max_num_seqs
+# - compute_tokens (C): 需要计算的token总数，每个请求计算 C/N 个token
+# - access_tokens (A): 需要访问的KV cache token总数，每个请求访问 A/N 个token
+#
+# 验证条件:
+# 1. batch_size <= max_num_seqs
+# 2. compute_tokens <= token_budget
+# 3. compute_tokens >= batch_size (每个请求至少计算1个token)
+# 4. compute_tokens % batch_size == 0 (整除)
+# 5. access_tokens >= 0 (可以为0，表示纯prefill)
+# 6. access_tokens % batch_size == 0 (整除，当access_tokens > 0时)
+# 7. (access_tokens + compute_tokens) / batch_size + 2 < max_model_len
+# 8. max_concurrent_batches * batch_size * prompt_len <= num_gpu_blocks * block_size
+
+# 显式测试用例（若提供，将优先于随机采样）
+# 下面是一个固定 (N=16, A=4096) 的 compute_tokens 扫描
+test_cases:
+  - batch_size: 1
+    compute_tokens: 1
+    access_tokens: 4096
+  - batch_size: 2
+    compute_tokens: 2
+    access_tokens: 4096
+  - batch_size: 4
+    compute_tokens: 4
+    access_tokens: 4096
+  - batch_size: 8
+    compute_tokens: 8
+    access_tokens: 4096
+  - batch_size: 16
+    compute_tokens: 16
+    access_tokens: 4096
+  - batch_size: 32
+    compute_tokens: 32
+    access_tokens: 4096

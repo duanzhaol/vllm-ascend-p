@@ -225,6 +225,19 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
+        # Debug logging for profile_step
+        logger.debug(
+            "[DEBUG] schedule() called: running=%d, waiting=%d",
+            len(self.running), len(self.waiting),
+        )
+        for req in self.running:
+            logger.debug(
+                "[DEBUG] RUNNING req: %s, num_computed_tokens=%d, "
+                "num_tokens=%d, skip_reading_prefix_cache=%s",
+                req.request_id, req.num_computed_tokens,
+                req.num_tokens, req.skip_reading_prefix_cache,
+            )
+
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -474,10 +487,27 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
 
                 # Get already-cached tokens.
-                if request.num_computed_tokens == 0:
+                # Skip prefix cache lookup if skip_reading_prefix_cache is set
+                # (used by profile_step to control exact token scheduling)
+                logger.debug(
+                    "[DEBUG] Request %s: num_computed_tokens=%d, "
+                    "skip_reading_prefix_cache=%s, status=%s",
+                    request.request_id,
+                    request.num_computed_tokens,
+                    request.skip_reading_prefix_cache,
+                    request.status,
+                )
+                if (request.num_computed_tokens == 0
+                        and not request.skip_reading_prefix_cache):
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
+                    )
+                    logger.debug(
+                        "[DEBUG] Request %s: after get_computed_blocks, "
+                        "num_new_local_computed_tokens=%d",
+                        request.request_id,
+                        num_new_local_computed_tokens,
                     )
 
                     # Get externally-cached tokens if using a KVConnector.
@@ -527,6 +557,15 @@ class Scheduler(SchedulerInterface):
                     threshold = self.scheduler_config.long_prefill_token_threshold
                     if 0 < threshold < num_new_tokens:
                         num_new_tokens = threshold
+
+                    # Skip requests with no new tokens to schedule.
+                    # This can happen during profiling when requests are
+                    # temporarily deactivated by setting num_computed_tokens
+                    # equal to num_tokens.
+                    if num_new_tokens <= 0:
+                        self.waiting.pop_request()
+                        skipped_waiting_requests.prepend_request(request)
+                        continue
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked

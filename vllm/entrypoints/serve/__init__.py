@@ -58,3 +58,10 @@ def register_vllm_serve_api_routers(app: FastAPI):
     )
 
     attach_health_router(app)
+
+    # Register vllm-ascend profiling router if available
+    try:
+        from vllm_ascend.entrypoints.profiling_router import profiling_router
+        app.include_router(profiling_router)
+    except ImportError:
+        pass  # vllm-ascend not installed

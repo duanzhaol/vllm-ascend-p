@@ -790,6 +790,63 @@ class AsyncLLM(EngineClient):
             method, timeout, args, kwargs
         )
 
+    async def profile_batch(
+        self,
+        batch_size: int,
+        compute_tokens: int,
+        access_tokens: int,
+        num_iterations: int = 100,
+        warmup_iterations: int = 10,
+    ) -> dict:
+        """
+        Profile forward pass latency for a specific
+        (batch_size, compute_tokens, access_tokens) tuple.
+
+        Args:
+            batch_size: Number of concurrent requests (N)
+            compute_tokens: Total tokens to compute in this chunk (C)
+            access_tokens: Total tokens already in KV cache (A)
+            num_iterations: Number of measurement iterations
+            warmup_iterations: Number of warmup iterations
+
+        Returns:
+            dict with avg_forward_time_ms, std_forward_time_ms, etc.
+        """
+        return await self.engine_core.profile_batch_async(
+            batch_size, compute_tokens, access_tokens,
+            num_iterations, warmup_iterations
+        )
+
+    async def profile_step(
+        self,
+        batch_size: int,
+        compute_tokens: int,
+        access_tokens: int,
+        num_iterations: int = 20,
+        warmup_iterations: int = 5,
+    ) -> dict:
+        """
+        Measure steady-state step throughput cadence for a given load config.
+
+        This method measures the time interval between adjacent batch completions
+        in a pipeline-parallel scenario, which represents the steady-state
+        throughput cadence.
+
+        Args:
+            batch_size: Number of concurrent requests (N)
+            compute_tokens: Total tokens to compute in this step (C)
+            access_tokens: Total tokens already in KV cache (A)
+            num_iterations: Number of measurement iterations
+            warmup_iterations: Number of warmup iterations
+
+        Returns:
+            dict with avg_step_time_ms, std_step_time_ms, etc.
+        """
+        return await self.engine_core.profile_step_async(
+            batch_size, compute_tokens, access_tokens,
+            num_iterations, warmup_iterations
+        )
+
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""
         start_time = time.time()

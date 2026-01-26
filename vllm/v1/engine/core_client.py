@@ -178,6 +178,26 @@ class EngineCoreClient(ABC):
     ) -> None:
         raise NotImplementedError
 
+    def profile_batch(
+        self,
+        batch_size: int,
+        compute_tokens: int,
+        access_tokens: int,
+        num_iterations: int = 100,
+        warmup_iterations: int = 10,
+    ) -> dict:
+        raise NotImplementedError
+
+    def profile_step(
+        self,
+        batch_size: int,
+        compute_tokens: int,
+        access_tokens: int,
+        num_iterations: int = 20,
+        warmup_iterations: int = 5,
+    ) -> dict:
+        raise NotImplementedError
+
     def collective_rpc(
         self,
         method: str | Callable[..., _R],
@@ -242,6 +262,26 @@ class EngineCoreClient(ABC):
     async def save_sharded_state_async(
         self, path: str, pattern: str | None = None, max_size: int | None = None
     ) -> None:
+        raise NotImplementedError
+
+    async def profile_batch_async(
+        self,
+        batch_size: int,
+        compute_tokens: int,
+        access_tokens: int,
+        num_iterations: int = 100,
+        warmup_iterations: int = 10,
+    ) -> dict:
+        raise NotImplementedError
+
+    async def profile_step_async(
+        self,
+        batch_size: int,
+        compute_tokens: int,
+        access_tokens: int,
+        num_iterations: int = 20,
+        warmup_iterations: int = 5,
+    ) -> dict:
         raise NotImplementedError
 
     async def collective_rpc_async(
@@ -326,6 +366,32 @@ class InprocClient(EngineCoreClient):
         self, path: str, pattern: str | None = None, max_size: int | None = None
     ) -> None:
         self.engine_core.save_sharded_state(path, pattern, max_size)
+
+    def profile_batch(
+        self,
+        batch_size: int,
+        compute_tokens: int,
+        access_tokens: int,
+        num_iterations: int = 100,
+        warmup_iterations: int = 10,
+    ) -> dict:
+        return self.engine_core.profile_batch(
+            batch_size, compute_tokens, access_tokens,
+            num_iterations, warmup_iterations
+        )
+
+    def profile_step(
+        self,
+        batch_size: int,
+        compute_tokens: int,
+        access_tokens: int,
+        num_iterations: int = 20,
+        warmup_iterations: int = 5,
+    ) -> dict:
+        return self.engine_core.profile_step(
+            batch_size, compute_tokens, access_tokens,
+            num_iterations, warmup_iterations
+        )
 
     def collective_rpc(
         self,
@@ -804,6 +870,32 @@ class SyncMPClient(MPClient):
     ) -> None:
         self.call_utility("save_sharded_state", path, pattern, max_size)
 
+    def profile_batch(
+        self,
+        batch_size: int,
+        compute_tokens: int,
+        access_tokens: int,
+        num_iterations: int = 100,
+        warmup_iterations: int = 10,
+    ) -> dict:
+        return self.call_utility(
+            "profile_batch", batch_size, compute_tokens, access_tokens,
+            num_iterations, warmup_iterations
+        )
+
+    def profile_step(
+        self,
+        batch_size: int,
+        compute_tokens: int,
+        access_tokens: int,
+        num_iterations: int = 20,
+        warmup_iterations: int = 5,
+    ) -> dict:
+        return self.call_utility(
+            "profile_step", batch_size, compute_tokens, access_tokens,
+            num_iterations, warmup_iterations
+        )
+
 
 class AsyncMPClient(MPClient):
     """Asyncio-compatible client for multi-proc EngineCore."""
@@ -1002,6 +1094,32 @@ class AsyncMPClient(MPClient):
         self, path: str, pattern: str | None = None, max_size: int | None = None
     ) -> None:
         await self.call_utility_async("save_sharded_state", path, pattern, max_size)
+
+    async def profile_batch_async(
+        self,
+        batch_size: int,
+        compute_tokens: int,
+        access_tokens: int,
+        num_iterations: int = 100,
+        warmup_iterations: int = 10,
+    ) -> dict:
+        return await self.call_utility_async(
+            "profile_batch", batch_size, compute_tokens, access_tokens,
+            num_iterations, warmup_iterations
+        )
+
+    async def profile_step_async(
+        self,
+        batch_size: int,
+        compute_tokens: int,
+        access_tokens: int,
+        num_iterations: int = 20,
+        warmup_iterations: int = 5,
+    ) -> dict:
+        return await self.call_utility_async(
+            "profile_step", batch_size, compute_tokens, access_tokens,
+            num_iterations, warmup_iterations
+        )
 
     async def collective_rpc_async(
         self,

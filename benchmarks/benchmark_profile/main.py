@@ -78,11 +78,31 @@ async def run_batch_tests(
 
     print(f"\n共 {len(test_configs)} 个测试配置")
 
+    # 预先验证所有配置，过滤掉无效的
+    valid_configs = []
+    skipped_count = 0
+    for i, (batch_size, compute_tokens, access_tokens) in enumerate(test_configs):
+        valid, error_msg = validate_params(
+            batch_size, compute_tokens, access_tokens, config
+        )
+        if valid:
+            valid_configs.append((batch_size, compute_tokens, access_tokens))
+        else:
+            skipped_count += 1
+            print(f"[{i+1}/{len(test_configs)}] [跳过] "
+                  f"batch_size={batch_size}, "
+                  f"compute_tokens={compute_tokens}, "
+                  f"access_tokens={access_tokens}")
+            print(f"  原因: {error_msg}")
+
+    print(f"\n验证完成: {len(valid_configs)} 个有效, {skipped_count} 个跳过")
+    print(f"将运行 {len(valid_configs)} 个有效配置")
+
     results = []
     write_header = not os.path.exists(args.output_file)
 
-    for i, (batch_size, compute_tokens, access_tokens) in enumerate(test_configs):
-        print(f"\n[{i+1}/{len(test_configs)}] "
+    for i, (batch_size, compute_tokens, access_tokens) in enumerate(valid_configs):
+        print(f"\n[{i+1}/{len(valid_configs)}] "
               f"batch_size={batch_size}, "
               f"compute_tokens={compute_tokens}, "
               f"access_tokens={access_tokens}")
@@ -118,8 +138,9 @@ async def main():
   # 单次测试
   python -m benchmark_profile --batch-size 32 --compute-tokens 512 --access-tokens 4096
 
-  # 使用预设配置批量测试
-  python -m benchmark_profile --preset decode --output decode_results.csv
+  # 使用预设配置批量测试（指定服务器限制以过滤无效配置）
+  python -m benchmark_profile --preset decode --output decode_results.csv \\
+      --max-num-batched-tokens 4096 --max-num-seqs 256
 
   # 使用配置文件批量测试
   python -m benchmark_profile --config configs/profile_config.yaml --num-samples 100
@@ -149,6 +170,26 @@ async def main():
     parser.add_argument("--num-iterations", type=int, default=20, help="测量迭代次数")
     parser.add_argument("--warmup-iterations", type=int, default=5, help="预热迭代次数")
 
+    # 服务器限制参数（用于 client 端验证，默认值与 vLLM 一致）
+    parser.add_argument(
+        "--max-num-batched-tokens",
+        type=int,
+        default=2048,
+        help="服务器的 max_num_batched_tokens 限制 (默认: 2048)"
+    )
+    parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=128,
+        help="服务器的 max_num_seqs 限制 (默认: 128)"
+    )
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=None,
+        help="服务器的 max_model_len 限制 (默认: 不限制)"
+    )
+
     # 输出
     parser.add_argument("--output-file", type=str, default="profile_results.csv", help="输出文件")
 
@@ -173,6 +214,12 @@ async def main():
     config = {}
     if args.config:
         config = load_config(args.config)
+
+    # 将命令行指定的服务器限制添加到 config 中
+    config["token_budget"] = args.max_num_batched_tokens
+    config["max_num_seqs"] = args.max_num_seqs
+    if args.max_model_len is not None:
+        config["max_model_len"] = args.max_model_len
 
     if is_single_test:
         # 单次测试 - 先进行本地参数验证

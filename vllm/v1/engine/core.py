@@ -778,16 +778,27 @@ class EngineCore:
             self.model_executor.max_concurrent_batches if use_batch_queue else 1
         )
 
+        # Distribute batch across pipeline groups.
+        # Each group has per_group_batch_size requests; total = batch_size.
+        if max_concurrent > 1 and batch_size % max_concurrent != 0:
+            raise ValueError(
+                f"batch_size ({batch_size}) must be divisible by "
+                f"max_concurrent_batches ({max_concurrent})"
+            )
+        per_group_batch_size = batch_size // max_concurrent
+
         access_per_request = access_tokens // batch_size
         compute_per_request = compute_tokens // batch_size
         # Prompt length = access_per_request + compute_per_request
         # This ensures num_new_tokens = prompt_len - access_per_request = compute_per_request
         prompt_len = access_per_request + compute_per_request
+        per_step_compute_tokens = per_group_batch_size * compute_per_request
 
         # Save original config before any modifications
         original_threshold = (
             self.vllm_config.scheduler_config.long_prefill_token_threshold
         )
+        request_groups: list[list[str]] = []
 
         try:
             # Check engine is idle before profiling
@@ -800,31 +811,44 @@ class EngineCore:
             # ==================== Parameter Validation ====================
             self._validate_profile_step_params(
                 batch_size, compute_tokens, access_tokens,
-                prompt_len, max_concurrent, compute_per_request
+                prompt_len, max_concurrent, compute_per_request,
+                per_group_batch_size, per_step_compute_tokens,
             )
 
             # Get special token IDs to exclude from random generation
             special_token_ids = self._get_special_token_ids()
 
             # ==================== Phase 1: Create Requests and Fill KV Cache ====================
-            request_groups: list[list[str]] = []
             # Calculate max_tokens needed: each request is scheduled once per max_concurrent steps
             # Total steps = pipeline_fill + warmup + measurement + 1
             # Each request needs enough tokens to not finish during profiling
             pipeline_fill_steps = max_concurrent - 1
             total_steps = pipeline_fill_steps + warmup_iterations + num_iterations + 1
             # Each request is scheduled total_steps / max_concurrent times (rounded up)
-            max_tokens_needed = (total_steps + max_concurrent - 1) // max_concurrent + 10
+            profiling_tokens = (total_steps + max_concurrent - 1) // max_concurrent
+            # During KV fill, requests generate tokens while waiting for other requests
+            # to complete their prefill. First request in a group completes early and
+            # generates decode tokens while subsequent requests are still prefilling.
+            # Estimate: each request may generate up to 2*batch_size tokens during KV fill
+            kv_fill_tokens = batch_size * 2 * max_concurrent
+            max_tokens_needed = profiling_tokens + kv_fill_tokens + 20
             sampling_params = SamplingParams(
                 max_tokens=max_tokens_needed,
                 temperature=0.0,
-                skip_reading_prefix_cache=True
+                skip_reading_prefix_cache=True,
+                ignore_eos=True,
+            )
+
+            logger.debug(
+                "[DEBUG] KV fill phase: creating %d groups × %d requests, "
+                "prompt_len=%d, access_per_request=%d",
+                max_concurrent, per_group_batch_size, prompt_len, access_per_request,
             )
 
             for group_idx in range(max_concurrent):
                 # Create a group of requests with random tokens
                 group_request_ids = []
-                for i in range(batch_size):
+                for i in range(per_group_batch_size):
                     request_id = f"profile_step_g{group_idx}_{uuid.uuid4().hex[:8]}_{i}"
                     # Use local RNG to avoid polluting global random state
                     rng = random.Random(hash(request_id))
@@ -853,6 +877,10 @@ class EngineCore:
 
                 # Deactivate this group (set num_computed_tokens = num_tokens)
                 self._deactivate_profile_group(group_request_ids)
+                logger.debug(
+                    "[DEBUG] KV fill: group g%d completed (%d/%d)",
+                    group_idx, group_idx + 1, max_concurrent,
+                )
 
             # ==================== Modify Scheduler Config ====================
             # Limit each request to schedule at most compute_per_request tokens
@@ -862,13 +890,18 @@ class EngineCore:
             )
 
             # ==================== Phase 2: Measurement ====================
+            logger.debug(
+                "[DEBUG] Profiling phase: %d groups ready, "
+                "warmup=%d, iterations=%d",
+                max_concurrent, warmup_iterations, num_iterations,
+            )
             if use_batch_queue:
                 # PP > 1 or async_scheduling: use batch_queue mode
                 step_times = self._profile_step_with_batch_queue(
                     request_groups=request_groups,
                     access_per_request=access_per_request,
                     compute_per_request=compute_per_request,
-                    compute_tokens=compute_tokens,
+                    compute_tokens=per_step_compute_tokens,
                     prompt_len=prompt_len,
                     max_concurrent=max_concurrent,
                     num_iterations=num_iterations,
@@ -880,7 +913,7 @@ class EngineCore:
                     request_ids=request_groups[0],  # Only 1 group in sync mode
                     access_per_request=access_per_request,
                     compute_per_request=compute_per_request,
-                    compute_tokens=compute_tokens,
+                    compute_tokens=per_step_compute_tokens,
                     prompt_len=prompt_len,
                     num_iterations=num_iterations,
                     warmup_iterations=warmup_iterations,
@@ -1098,6 +1131,8 @@ class EngineCore:
         prompt_len: int,
         max_concurrent: int,
         compute_per_request: int,
+        per_group_batch_size: int,
+        per_step_compute_tokens: int,
     ) -> None:
         """Validate parameters for profile_step."""
         if batch_size <= 0:
@@ -1121,19 +1156,18 @@ class EngineCore:
         max_num_batched_tokens = (
             self.vllm_config.scheduler_config.max_num_batched_tokens
         )
-        if compute_tokens > max_num_batched_tokens:
+        if per_step_compute_tokens > max_num_batched_tokens:
             raise ValueError(
-                f"compute_tokens ({compute_tokens}) exceeds "
+                f"per_step_compute_tokens ({per_step_compute_tokens}) exceeds "
                 f"max_num_batched_tokens ({max_num_batched_tokens})"
             )
 
-        # Total requests = max_concurrent * batch_size
-        total_requests = max_concurrent * batch_size
+        # Total requests = batch_size (distributed across max_concurrent groups)
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
-        if total_requests > max_num_seqs:
+        if batch_size > max_num_seqs:
             raise ValueError(
-                f"total_requests ({total_requests} = {max_concurrent} groups × "
-                f"{batch_size} batch_size) exceeds max_num_seqs ({max_num_seqs})"
+                f"batch_size ({batch_size}) exceeds "
+                f"max_num_seqs ({max_num_seqs})"
             )
 
         # compute_per_request must be positive
@@ -1143,8 +1177,8 @@ class EngineCore:
             )
 
         # KV cache capacity validation
-        # Total KV tokens needed = max_concurrent * batch_size * prompt_len
-        total_kv_tokens = max_concurrent * batch_size * prompt_len
+        # Total KV tokens needed = batch_size * prompt_len
+        total_kv_tokens = batch_size * prompt_len
         num_gpu_blocks = self.vllm_config.cache_config.num_gpu_blocks
         block_size = self.vllm_config.cache_config.block_size
 
@@ -1158,7 +1192,7 @@ class EngineCore:
             total_kv_capacity = num_gpu_blocks * block_size
             if total_kv_tokens > total_kv_capacity:
                 raise ValueError(
-                    f"Total KV tokens needed ({total_kv_tokens} = {max_concurrent} groups × "
+                    f"Total KV tokens needed ({total_kv_tokens} = "
                     f"{batch_size} batch_size × {prompt_len} prompt_len) exceeds "
                     f"KV cache capacity (approx. {total_kv_capacity} = {num_gpu_blocks} blocks × "
                     f"{block_size} block_size). Note: actual capacity may vary due to "
@@ -1279,22 +1313,19 @@ class EngineCore:
 
         This works correctly even after output tokens have been generated.
         """
+        activated_count = 0
         for req_id in request_ids:
             if req_id in self.scheduler.requests:
                 request = self.scheduler.requests[req_id]
                 # Set num_computed_tokens so that exactly compute_per_request tokens will be scheduled
                 request.num_computed_tokens = request.num_tokens - compute_per_request
-                logger.debug(
-                    "[DEBUG] _activate_profile_group: req_id=%s, "
-                    "compute_per_request=%d, num_computed_tokens=%d, "
-                    "skip_reading_prefix_cache=%s, status=%s, num_tokens=%d",
-                    req_id,
-                    compute_per_request,
-                    request.num_computed_tokens,
-                    request.skip_reading_prefix_cache,
-                    request.status,
-                    request.num_tokens,
-                )
+                activated_count += 1
+        # Extract group name from first request_id (e.g., "profile_step_g0_xxx_0" -> "g0")
+        group_name = request_ids[0].split("_")[2] if request_ids else "unknown"
+        logger.debug(
+            "[DEBUG] Activated group %s: %d requests, %d tokens/req",
+            group_name, activated_count, compute_per_request,
+        )
 
     def _deactivate_profile_group(
         self, request_ids: list[str]

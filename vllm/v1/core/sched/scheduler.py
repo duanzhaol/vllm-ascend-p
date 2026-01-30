@@ -225,18 +225,29 @@ class Scheduler(SchedulerInterface):
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
 
-        # Debug logging for profile_step
-        logger.debug(
-            "[DEBUG] schedule() called: running=%d, waiting=%d",
-            len(self.running), len(self.waiting),
-        )
-        for req in self.running:
-            logger.debug(
-                "[DEBUG] RUNNING req: %s, num_computed_tokens=%d, "
-                "num_tokens=%d, skip_reading_prefix_cache=%s",
-                req.request_id, req.num_computed_tokens,
-                req.num_tokens, req.skip_reading_prefix_cache,
+        # Verbose per-step logging for debugging (use TRACE level)
+        active_reqs = [r for r in self.running
+                       if r.num_computed_tokens < r.num_tokens]
+        frozen_reqs = len(self.running) - len(active_reqs)
+
+        if active_reqs or self.waiting:
+            logger.trace(
+                "[TRACE] schedule(): running=%d (active=%d, frozen=%d), "
+                "waiting=%d",
+                len(self.running), len(active_reqs), frozen_reqs,
+                len(self.waiting),
             )
+            # Only log active requests (those with tokens to compute)
+            for req in active_reqs[:8]:  # Limit to first 8 to avoid spam
+                logger.trace(
+                    "  -> %s: compute %d tokens (total=%d)",
+                    req.request_id,
+                    req.num_tokens - req.num_computed_tokens,
+                    req.num_tokens,
+                )
+            if len(active_reqs) > 8:
+                logger.trace("  ... and %d more active requests",
+                             len(active_reqs) - 8)
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -489,25 +500,11 @@ class Scheduler(SchedulerInterface):
                 # Get already-cached tokens.
                 # Skip prefix cache lookup if skip_reading_prefix_cache is set
                 # (used by profile_step to control exact token scheduling)
-                logger.debug(
-                    "[DEBUG] Request %s: num_computed_tokens=%d, "
-                    "skip_reading_prefix_cache=%s, status=%s",
-                    request.request_id,
-                    request.num_computed_tokens,
-                    request.skip_reading_prefix_cache,
-                    request.status,
-                )
                 if (request.num_computed_tokens == 0
                         and not request.skip_reading_prefix_cache):
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
-                    )
-                    logger.debug(
-                        "[DEBUG] Request %s: after get_computed_blocks, "
-                        "num_new_local_computed_tokens=%d",
-                        request.request_id,
-                        num_new_local_computed_tokens,
                     )
 
                     # Get externally-cached tokens if using a KVConnector.

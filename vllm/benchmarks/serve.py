@@ -19,6 +19,7 @@ On the client side, run:
 import argparse
 import asyncio
 import contextlib
+import csv
 import importlib.util
 import json
 import os
@@ -1301,15 +1302,383 @@ def add_cli_args(parser: argparse.ArgumentParser):
         default=None,
     )
 
+    # Sweep parameters for running multiple configurations
+    sweep_group = parser.add_argument_group("sweep parameters")
+    sweep_group.add_argument(
+        "--request-rate-sweep",
+        type=str,
+        default=None,
+        help="Comma-separated list of request rates to sweep. "
+        "Example: '1,5,10,20,50'. When specified, --request-rate is ignored.",
+    )
+    sweep_group.add_argument(
+        "--num-prompts-sweep",
+        type=str,
+        default=None,
+        help="Comma-separated list of num-prompts values to sweep. "
+        "Example: '100,500,1000'. When specified, --num-prompts is ignored.",
+    )
+    sweep_group.add_argument(
+        "--max-concurrency-sweep",
+        type=str,
+        default=None,
+        help="Comma-separated list of max-concurrency values to sweep. "
+        "Example: '1,4,8,16'. When specified, --max-concurrency is ignored.",
+    )
+    sweep_group.add_argument(
+        "--random-input-len-sweep",
+        type=str,
+        default=None,
+        help="Comma-separated list of random-input-len values to sweep. "
+        "Example: '512,1024,2048'. When specified, --random-input-len is ignored.",
+    )
+    sweep_group.add_argument(
+        "--random-output-len-sweep",
+        type=str,
+        default=None,
+        help="Comma-separated list of random-output-len values to sweep. "
+        "Example: '64,128,256'. When specified, --random-output-len is ignored.",
+    )
 
-def main(args: argparse.Namespace) -> dict[str, Any]:
+    # Batch mode parameters
+    batch_group = parser.add_argument_group("batch mode parameters")
+    batch_group.add_argument(
+        "--batch-mode",
+        action="store_true",
+        help="Enable batch mode. In batch mode, all requests are sent at once. "
+        "request_rate is set to inf, num_prompts and max_concurrency are set to batch_size.",
+    )
+    batch_group.add_argument(
+        "--batch-size-sweep",
+        type=str,
+        default=None,
+        help="Comma-separated list of batch sizes to sweep in batch mode. "
+        "Example: '1,2,4,8,16'. Requires --batch-mode.",
+    )
+
+
+def parse_sweep_values(sweep_str: str | None, value_type: type = float) -> list | None:
+    """Parse comma-separated sweep values into a list."""
+    if sweep_str is None:
+        return None
+    values = []
+    for v in sweep_str.split(","):
+        v = v.strip()
+        if value_type == float and v.lower() == "inf":
+            values.append(float("inf"))
+        else:
+            values.append(value_type(v))
+    return values
+
+
+def generate_batch_configs(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Generate batch mode configurations."""
+    batch_sizes = parse_sweep_values(args.batch_size_sweep, int)
+    if batch_sizes is None:
+        raise ValueError("--batch-size-sweep is required when using --batch-mode")
+
+    random_input_lens = parse_sweep_values(args.random_input_len_sweep, int)
+    random_output_lens = parse_sweep_values(args.random_output_len_sweep, int)
+
+    # Use single values if sweep not specified
+    if random_input_lens is None:
+        random_input_lens = [args.random_input_len]
+    if random_output_lens is None:
+        random_output_lens = [args.random_output_len]
+
+    # Generate all combinations
+    configs = []
+    for bs in batch_sizes:
+        for ril in random_input_lens:
+            for rol in random_output_lens:
+                configs.append({
+                    "batch_size": bs,
+                    "request_rate": float("inf"),  # Send all at once
+                    "num_prompts": bs,
+                    "max_concurrency": bs,
+                    "random_input_len": ril,
+                    "random_output_len": rol,
+                })
+    return configs
+
+
+def generate_sweep_configs(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Generate all sweep configuration combinations."""
+    # Parse sweep parameters
+    request_rates = parse_sweep_values(args.request_rate_sweep, float)
+    num_prompts_list = parse_sweep_values(args.num_prompts_sweep, int)
+    max_concurrencies = parse_sweep_values(args.max_concurrency_sweep, int)
+    random_input_lens = parse_sweep_values(args.random_input_len_sweep, int)
+    random_output_lens = parse_sweep_values(args.random_output_len_sweep, int)
+
+    # If no sweep parameters, return empty list (use original args)
+    if not any([request_rates, num_prompts_list, max_concurrencies,
+                random_input_lens, random_output_lens]):
+        return []
+
+    # Use single values if sweep not specified
+    if request_rates is None:
+        request_rates = [args.request_rate]
+    if num_prompts_list is None:
+        num_prompts_list = [args.num_prompts]
+    if max_concurrencies is None:
+        max_concurrencies = [args.max_concurrency]
+    if random_input_lens is None:
+        random_input_lens = [args.random_input_len]
+    if random_output_lens is None:
+        random_output_lens = [args.random_output_len]
+
+    # Generate all combinations
+    configs = []
+    for rr in request_rates:
+        for np in num_prompts_list:
+            for mc in max_concurrencies:
+                for ril in random_input_lens:
+                    for rol in random_output_lens:
+                        configs.append({
+                            "request_rate": rr,
+                            "num_prompts": np,
+                            "max_concurrency": mc,
+                            "random_input_len": ril,
+                            "random_output_len": rol,
+                        })
+    return configs
+
+
+def main(args: argparse.Namespace) -> dict[str, Any] | list[dict[str, Any]]:
     return asyncio.run(main_async(args))
 
 
-async def main_async(args: argparse.Namespace) -> dict[str, Any]:
+async def main_async(args: argparse.Namespace) -> dict[str, Any] | list[dict[str, Any]]:
     print(args)
     random.seed(args.seed)
     np.random.seed(args.seed)
+
+    # Check for batch mode
+    if args.batch_mode:
+        batch_configs = generate_batch_configs(args)
+        return await run_sweep_benchmarks(args, batch_configs, mode="batch")
+
+    # Check for sweep configurations
+    sweep_configs = generate_sweep_configs(args)
+    if sweep_configs:
+        return await run_sweep_benchmarks(args, sweep_configs, mode="sweep")
+
+    # Original single-run logic
+    return await run_single_benchmark(args)
+
+
+async def run_sweep_benchmarks(
+    args: argparse.Namespace,
+    sweep_configs: list[dict[str, Any]],
+    mode: str = "sweep",
+) -> list[dict[str, Any]]:
+    """Run benchmarks for multiple configurations."""
+    mode_name = "batch" if mode == "batch" else "sweep"
+    print(f"\n{'='*60}")
+    print(f"Running {mode_name} benchmark with {len(sweep_configs)} configurations")
+    print(f"{'='*60}\n")
+
+    all_results = []
+    for i, config in enumerate(sweep_configs):
+        print(f"\n{'='*60}")
+        print(f"Configuration {i+1}/{len(sweep_configs)}:")
+        for key, value in config.items():
+            print(f"  {key}: {value}")
+        print(f"{'='*60}\n")
+
+        # Create a copy of args with updated values
+        sweep_args = argparse.Namespace(**vars(args))
+        sweep_args.request_rate = config["request_rate"]
+        sweep_args.num_prompts = config["num_prompts"]
+        sweep_args.max_concurrency = config["max_concurrency"]
+        sweep_args.random_input_len = config["random_input_len"]
+        sweep_args.random_output_len = config["random_output_len"]
+
+        # Clear sweep parameters to avoid recursion
+        sweep_args.request_rate_sweep = None
+        sweep_args.num_prompts_sweep = None
+        sweep_args.max_concurrency_sweep = None
+        sweep_args.random_input_len_sweep = None
+        sweep_args.random_output_len_sweep = None
+
+        # Use different seed for each config to avoid prefix cache hits
+        # due to identical token sequences across different input lengths
+        # NOTE: Must modify sweep_args.seed because RandomDataset uses it
+        sweep_args.seed = args.seed + i
+        random.seed(sweep_args.seed)
+        np.random.seed(sweep_args.seed)
+
+        try:
+            result = await run_single_benchmark(sweep_args)
+            # Add sweep config info to result
+            result["sweep_config"] = config
+            all_results.append(result)
+        except Exception as e:
+            print(f"Error running configuration {i+1}: {e}")
+            all_results.append({
+                "sweep_config": config,
+                "error": str(e),
+            })
+
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"{mode_name.capitalize()} Benchmark Summary")
+    print(f"{'='*60}")
+    for i, result in enumerate(all_results):
+        config = result.get("sweep_config", {})
+        if "error" in result:
+            print(f"Config {i+1}: ERROR - {result['error']}")
+        else:
+            config_str = ", ".join(f"{k}={v}" for k, v in config.items())
+            print(
+                f"Config {i+1}: {config_str} -> "
+                f"throughput={result.get('request_throughput', 'N/A'):.2f} req/s, "
+                f"output_throughput={result.get('output_throughput', 'N/A'):.2f} tok/s"
+            )
+    print(f"{'='*60}\n")
+
+    # Save combined results if requested
+    if args.save_result or args.append_result:
+        current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+        base_model_id = args.model.split("/")[-1]
+        label = args.label or args.backend
+        base_file_name = f"{label}-{mode_name}-{base_model_id}-{current_dt}"
+        if args.result_filename:
+            base_file_name = os.path.splitext(args.result_filename)[0]
+
+        result_dir = args.result_dir or "."
+        os.makedirs(result_dir, exist_ok=True)
+
+        # Save JSON
+        json_file = os.path.join(result_dir, f"{base_file_name}.json")
+        with open(json_file, mode="w", encoding="utf-8") as outfile:
+            json.dump({f"{mode_name}_results": all_results}, outfile, indent=2)
+        print(f"{mode_name.capitalize()} results saved to: {json_file}")
+
+        # Save CSV summary
+        csv_file = os.path.join(result_dir, f"{base_file_name}.csv")
+        save_sweep_results_to_csv(all_results, csv_file, mode_name)
+        print(f"{mode_name.capitalize()} CSV summary saved to: {csv_file}")
+
+    return all_results
+
+
+def save_sweep_results_to_csv(
+    results: list[dict[str, Any]],
+    csv_file: str,
+    mode_name: str,
+) -> None:
+    """Save sweep/batch results to CSV file."""
+    if not results:
+        return
+
+    # Define CSV columns
+    config_columns = [
+        "batch_size", "request_rate", "num_prompts", "max_concurrency",
+        "random_input_len", "random_output_len",
+    ]
+    throughput_columns = [
+        "request_throughput", "output_throughput", "total_token_throughput",
+    ]
+    ttft_columns = [
+        "mean_ttft_ms", "median_ttft_ms", "std_ttft_ms",
+        "p50_ttft_ms", "p90_ttft_ms", "p95_ttft_ms", "p99_ttft_ms",
+    ]
+    tpot_columns = [
+        "mean_tpot_ms", "median_tpot_ms", "std_tpot_ms",
+        "p50_tpot_ms", "p90_tpot_ms", "p95_tpot_ms", "p99_tpot_ms",
+    ]
+    itl_columns = [
+        "mean_itl_ms", "median_itl_ms", "std_itl_ms",
+    ]
+    e2el_columns = [
+        "mean_e2el_ms", "median_e2el_ms", "std_e2el_ms",
+    ]
+    other_columns = [
+        "completed", "failed", "duration",
+        "total_input_tokens", "total_output_tokens",
+    ]
+
+    all_columns = (
+        config_columns + throughput_columns + ttft_columns +
+        tpot_columns + itl_columns + e2el_columns + other_columns + ["error"]
+    )
+
+    rows = []
+    for result in results:
+        row = {}
+        config = result.get("sweep_config", {})
+
+        # Config columns
+        for col in config_columns:
+            row[col] = config.get(col, "")
+
+        # Result columns
+        for col in throughput_columns + other_columns:
+            val = result.get(col)
+            row[col] = f"{val:.4f}" if isinstance(val, float) else (val if val is not None else "")
+
+        # TTFT columns
+        for col in ttft_columns:
+            val = result.get(col)
+            row[col] = f"{val:.2f}" if isinstance(val, float) else (val if val is not None else "")
+
+        # TPOT columns
+        for col in tpot_columns:
+            val = result.get(col)
+            row[col] = f"{val:.2f}" if isinstance(val, float) else (val if val is not None else "")
+
+        # ITL columns
+        for col in itl_columns:
+            val = result.get(col)
+            row[col] = f"{val:.2f}" if isinstance(val, float) else (val if val is not None else "")
+
+        # E2EL columns
+        for col in e2el_columns:
+            val = result.get(col)
+            row[col] = f"{val:.2f}" if isinstance(val, float) else (val if val is not None else "")
+
+        # Error
+        row["error"] = result.get("error", "")
+
+        rows.append(row)
+
+    # Write CSV
+    with open(csv_file, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=all_columns)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    # Also print CSV to console
+    print(f"\n{'='*100}")
+    print(f"{mode_name.capitalize()} Benchmark Results (CSV)")
+    print(f"{'='*100}")
+
+    # Print header - include actual input tokens for debugging
+    display_columns = [
+        "batch_size", "random_input_len", "total_input_tokens",
+        "request_throughput", "output_throughput",
+        "mean_ttft_ms", "p99_ttft_ms", "mean_tpot_ms", "p99_tpot_ms",
+    ]
+    header = " | ".join(f"{col:>18}" for col in display_columns)
+    print(header)
+    print("-" * len(header))
+
+    # Print rows
+    for row in rows:
+        if row.get("error"):
+            print(f"ERROR: {row['error']}")
+        else:
+            values = []
+            for col in display_columns:
+                val = row.get(col, "")
+                values.append(f"{val:>18}")
+            print(" | ".join(values))
+    print(f"{'='*80}\n")
+
+
+async def run_single_benchmark(args: argparse.Namespace) -> dict[str, Any]:
 
     # Validate ramp-up arguments
     if args.ramp_up_strategy is not None:

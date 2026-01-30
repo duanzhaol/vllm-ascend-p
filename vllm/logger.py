@@ -5,6 +5,10 @@
 import datetime
 import json
 import logging
+
+# Custom TRACE level (lower than DEBUG)
+TRACE = 5
+logging.addLevelName(TRACE, "TRACE")
 import os
 import sys
 from collections.abc import Generator, Hashable
@@ -115,6 +119,13 @@ class _VllmLogger(Logger):
         `intel_extension_for_pytorch.utils._logger`.
     """
 
+    def trace(self, msg: str, *args, **kwargs) -> None:
+        """
+        Log a message with TRACE level (lower than DEBUG).
+        Use this for very verbose logging that should normally be hidden.
+        """
+        self.log(TRACE, msg, *args, **kwargs)
+
     def debug_once(
         self, msg: str, *args: Hashable, scope: LogScope = "process"
     ) -> None:
@@ -149,6 +160,7 @@ class _VllmLogger(Logger):
 
 # Pre-defined methods mapping to avoid repeated dictionary creation
 _METHODS_TO_PATCH = {
+    "trace": _VllmLogger.trace,
     "debug_once": _VllmLogger.debug_once,
     "info_once": _VllmLogger.info_once,
     "warning_once": _VllmLogger.warning_once,

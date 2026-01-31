@@ -189,6 +189,14 @@ async def main():
         default=None,
         help="服务器的 max_model_len 限制 (默认: 不限制)"
     )
+    parser.add_argument(
+        "--kv-cache-tokens",
+        type=int,
+        default=None,
+        help="KV cache 总容量 (tokens, = num_gpu_blocks * block_size)。"
+             "约束 max_concurrent * B * prompt_len <= kv_cache_tokens。"
+             "若不设置则跳过 KV cache 容量检查。"
+    )
 
     # 输出
     parser.add_argument("--output-file", type=str, default="profile_results.csv", help="输出文件")
@@ -220,6 +228,9 @@ async def main():
     config["max_num_seqs"] = args.max_num_seqs
     if args.max_model_len is not None:
         config["max_model_len"] = args.max_model_len
+    if args.kv_cache_tokens is not None:
+        config["num_gpu_blocks"] = args.kv_cache_tokens
+        config["block_size"] = 1
 
     if is_single_test:
         # 单次测试 - 先进行本地参数验证

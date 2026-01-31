@@ -8,11 +8,13 @@
   c = compute_per_request, a = access_per_request
   C = B * c, A = B * a
 
-四层采样策略:
-  Decode  (40%): c=1 固定, a=log[64, max_len]
-  Prefill (20%): a=0 固定, c=log[64, budget/B]
-  Chunked (20%): c=log[32, min(1024, budget/B)], a=log[1, max_len-c]
-  General (20%): c=log[1, budget/B], a=log[0->1, max_len-c]
+三层采样 (按有效区域 log 体积分配配额):
+  Decode:  c=1 固定,  a ∈ [1, a_max(B)]
+  Prefill: a=0 固定,  c ∈ [1, c_max(B)]
+  Chunked: c ∈ [2, c_max(B)],  a ∈ [1, a_max(B,c)]
+
+所有采样上界均纳入 KV cache 容量约束。
+每层内对 log-B 做分层抽样以确保覆盖均匀。
 """
 
 import argparse
@@ -41,119 +43,306 @@ def log_uniform_int(lo, hi, rng):
     return max(lo, min(hi, round(val)))
 
 
-def _round_to_multiple(val, base):
-    """将 val 向上取整到 base 的倍数，至少返回 base。"""
-    if base <= 0:
-        return val
-    return max(base, math.ceil(val / base) * base)
+# ---- 核心采样器 (接受固定 B) ----
 
-
-def sample_decode(rng, max_seqs, max_len, budget):
-    """Decode 阶段: c=1 (固定), a=log[64, max_len-3]
-
-    B 从 [1, max_seqs] 对数均匀采样。
-    """
-    B = log_uniform_int(1, max_seqs, rng)
-    c = 1  # 每请求 1 token compute
+def _decode_given_B(B, rng, max_len, budget, kv_budget, kv_margin=0):
+    """Decode: c=1 固定, 给定 B 采样 a。"""
+    c = 1
     C = B * c
-
-    # token budget 约束: C <= budget
     if C > budget:
         return None
-
-    # a 范围: [64, max_model_len - c - 2 - 1]
-    # prompt_len = a + c + 2 < max_model_len
     a_max = max_len - c - 3
-    if a_max < 64:
-        return None
-    a = log_uniform_int(64, a_max, rng)
-    # 确保 A = B * a 能被 B 整除（已天然满足）
-    A = B * a
-    return (B, C, A)
-
-
-def sample_prefill(rng, max_seqs, max_len, budget):
-    """Prefill 阶段: a=0 (固定), c=log[64, budget/B]
-
-    B 从 [1, budget//64] 对数均匀采样。
-    """
-    B_max = min(max_seqs, budget // 64)
-    if B_max < 1:
-        return None
-    B = log_uniform_int(1, B_max, rng)
-
-    c_max = budget // B
-    # prompt_len = c + 0 + 2 < max_model_len => c < max_model_len - 3
-    c_max = min(c_max, max_len - 3)
-    if c_max < 64:
-        return None
-    c = log_uniform_int(64, c_max, rng)
-    C = B * c
-    A = 0
-    return (B, C, A)
-
-
-def sample_chunked(rng, max_seqs, max_len, budget):
-    """Chunked 阶段: c=log[32, min(1024, budget/B)], a=log[1, max_len-c-3]
-
-    B 从 [1, budget//32] 对数均匀采样。
-    """
-    B_max = min(max_seqs, budget // 32)
-    if B_max < 1:
-        return None
-    B = log_uniform_int(1, B_max, rng)
-
-    c_max = min(1024, budget // B)
-    # prompt_len 约束
-    c_max = min(c_max, max_len - 4)  # 至少留 a=1
-    if c_max < 32:
-        return None
-    c = log_uniform_int(32, c_max, rng)
-
-    a_max = max_len - c - 3
+    if kv_budget is not None:
+        a_max = min(a_max, kv_budget // B - c - 2 - kv_margin)
     if a_max < 1:
         return None
     a = log_uniform_int(1, a_max, rng)
-
-    C = B * c
-    A = B * a
-    return (B, C, A)
+    return (B, C, B * a)
 
 
-def sample_general(rng, max_seqs, max_len, budget):
-    """General 阶段: 自由组合
-
-    B=log[1, max_seqs], c=log[1, budget/B], a=log[0->1, max_len-c-3]
-    a 有 30% 概率为 0 (纯 prefill 边界情况)。
-    """
-    B = log_uniform_int(1, max_seqs, rng)
-
-    c_max = budget // B
-    c_max = min(c_max, max_len - 3)
+def _prefill_given_B(B, rng, max_len, budget, kv_budget, kv_margin=0):
+    """Prefill: a=0 固定, 给定 B 采样 c。"""
+    c_max = min(budget, budget // B, max_len - 3)
+    if kv_budget is not None:
+        c_max = min(c_max, kv_budget // B - 2 - kv_margin)
     if c_max < 1:
         return None
     c = log_uniform_int(1, c_max, rng)
+    return (B, B * c, 0)
 
-    C = B * c
 
-    # 30% 概率 a=0
-    if rng.random() < 0.3:
-        A = 0
-    else:
-        a_max = max_len - c - 3
-        if a_max < 1:
-            A = 0
-        else:
-            a = log_uniform_int(1, a_max, rng)
-            A = B * a
+def _chunked_given_B(B, rng, max_len, budget, kv_budget, kv_margin=0):
+    """Chunked: c>=2, a>=1, 给定 B 采样 c 和 a。"""
+    c_max = min(budget, budget // B, max_len - 4)
+    if kv_budget is not None:
+        # 留 a>=1 的空间: prompt_len = a+c+2 <= kv_budget//B - kv_margin
+        c_max = min(c_max, kv_budget // B - 3 - kv_margin)
+    if c_max < 2:
+        return None
+    c = log_uniform_int(2, c_max, rng)
+    a_max = max_len - c - 3
+    if kv_budget is not None:
+        a_max = min(a_max, kv_budget // B - c - 2 - kv_margin)
+    if a_max < 1:
+        return None
+    a = log_uniform_int(1, a_max, rng)
+    return (B, B * c, B * a)
 
-    return (B, C, A)
 
+# ---- 公共采样接口 ----
+
+def sample_decode(rng, max_seqs, max_len, budget, kv_budget=None):
+    """Decode: c=1 固定, a=log[1, a_max(B)]"""
+    B = log_uniform_int(1, max_seqs, rng)
+    return _decode_given_B(B, rng, max_len, budget, kv_budget)
+
+
+def sample_prefill(rng, max_seqs, max_len, budget, kv_budget=None):
+    """Prefill: a=0 固定, c=log[1, c_max(B)]"""
+    B = log_uniform_int(1, max_seqs, rng)
+    return _prefill_given_B(B, rng, max_len, budget, kv_budget)
+
+
+def sample_chunked(rng, max_seqs, max_len, budget, kv_budget=None):
+    """Chunked: c>=2, a>=1"""
+    B = log_uniform_int(1, max_seqs, rng)
+    return _chunked_given_B(B, rng, max_len, budget, kv_budget)
+
+
+# ---- 有效区域 log 体积估算 ----
+
+def _estimate_layer_volumes(effective_max_seqs, max_model_len, token_budget,
+                            kv_budget, kv_margin=0, n_B=500, n_c=100):
+    """数值积分估算各层在 log 空间中的有效区域体积。
+
+    Decode / Prefill 是 2D (log-B × log-a 或 log-c)。
+    Chunked 是 3D (log-B × log-c × log-a)。
+
+    Returns:
+        dict {layer_name: float} — 各层的 log 空间体积
+    """
+    if effective_max_seqs <= 1:
+        return {"decode": 1.0, "prefill": 1.0, "chunked": 1.0}
+
+    log_B_lo = math.log(1)
+    log_B_hi = math.log(effective_max_seqs)
+    dlogB = (log_B_hi - log_B_lo) / n_B
+
+    vol_decode = 0.0
+    vol_prefill = 0.0
+    vol_chunked = 0.0
+
+    for i in range(n_B):
+        logB = log_B_lo + (i + 0.5) * dlogB
+        B = max(1, round(math.exp(logB)))
+
+        # Decode: c=1, a ∈ [1, a_max]
+        a_max_d = max_model_len - 4
+        if kv_budget is not None:
+            a_max_d = min(a_max_d, kv_budget // B - 3 - kv_margin)
+        if a_max_d >= 1:
+            vol_decode += math.log(a_max_d) * dlogB
+
+        # Prefill: a=0, c ∈ [1, c_max]
+        c_max_p = min(token_budget, token_budget // max(B, 1), max_model_len - 3)
+        if kv_budget is not None:
+            c_max_p = min(c_max_p, kv_budget // B - 2 - kv_margin)
+        if c_max_p >= 1:
+            vol_prefill += math.log(c_max_p) * dlogB
+
+        # Chunked: c ∈ [2, c_max], a ∈ [1, a_max(c)]
+        c_max_ch = min(token_budget, token_budget // max(B, 1), max_model_len - 4)
+        if kv_budget is not None:
+            c_max_ch = min(c_max_ch, kv_budget // B - 3 - kv_margin)
+        if c_max_ch >= 2:
+            log_c_lo = math.log(2)
+            log_c_hi = math.log(c_max_ch)
+            dlogc = (log_c_hi - log_c_lo) / n_c
+            for j in range(n_c):
+                logc = log_c_lo + (j + 0.5) * dlogc
+                c = max(2, round(math.exp(logc)))
+                a_max_ch = max_model_len - c - 3
+                if kv_budget is not None:
+                    a_max_ch = min(a_max_ch, kv_budget // B - c - 2 - kv_margin)
+                if a_max_ch >= 1:
+                    vol_chunked += math.log(a_max_ch) * dlogc * dlogB
+
+    return {"decode": vol_decode, "prefill": vol_prefill, "chunked": vol_chunked}
+
+
+# ---- B 分层抽样 ----
+
+def _stratified_sample_layer(layer_name, sampler_given_B, target, rng,
+                              effective_max_seqs, max_model_len, token_budget,
+                              kv_budget, config, seen, kv_margin=0,
+                              n_strata=None):
+    """在 log-B 上分层抽样，确保 B 维度覆盖均匀。
+
+    将 [1, effective_max_seqs] 的 log 范围等分为 n_strata 段，
+    每段内分配等量样本配额。若某段无法生成足够样本，配额
+    顺延至后续段。
+    """
+    if target <= 0:
+        return []
+
+    if effective_max_seqs <= 1:
+        n_strata = 1
+    elif n_strata is None:
+        n_strata = max(1, min(target, int(math.sqrt(target))))
+
+    log_B_lo = math.log(1)
+    log_B_hi = math.log(max(1, effective_max_seqs))
+    strata_width = (log_B_hi - log_B_lo) / n_strata
+
+    # 分配每段配额
+    base = target // n_strata
+    extra = target % n_strata
+    allocations = [base + (1 if i < extra else 0) for i in range(n_strata)]
+
+    samples = []
+    shortfall = 0
+
+    for i in range(n_strata):
+        stratum_target = allocations[i] + shortfall
+        shortfall = 0
+
+        B_lo = max(1, round(math.exp(log_B_lo + i * strata_width)))
+        B_hi = max(B_lo, round(math.exp(log_B_lo + (i + 1) * strata_width)))
+        if i == n_strata - 1:
+            B_hi = max(B_lo, effective_max_seqs)
+
+        collected = 0
+        attempts = 0
+        max_attempts = max(stratum_target * 50, 200)
+
+        while collected < stratum_target and attempts < max_attempts:
+            attempts += 1
+            B = log_uniform_int(B_lo, B_hi, rng)
+            result = sampler_given_B(B, rng, max_model_len, token_budget, kv_budget, kv_margin)
+            if result is None:
+                continue
+            _, C, A = result
+            valid, _ = validate_params(B, C, A, config)
+            if not valid:
+                continue
+            key = (B, C, A)
+            if key in seen:
+                continue
+            seen.add(key)
+            samples.append((layer_name, B, C, A))
+            collected += 1
+
+        shortfall = stratum_target - collected
+
+    if shortfall > 0:
+        print(f"Warning: {layer_name} layer short by {shortfall} samples "
+              f"after stratified sampling", file=sys.stderr)
+
+    return samples
+
+
+# ---- 边界样本 ----
+
+def _log_steps(lo, hi, n):
+    """在 [lo, hi] 范围内生成 n 个对数等间距整数 (含两端)。"""
+    if lo > hi or n < 1:
+        return []
+    if lo == hi or n == 1:
+        return [lo]
+    pts = set()
+    for i in range(n):
+        t = i / (n - 1)
+        val = round(math.exp(math.log(lo) + t * (math.log(hi) - math.log(lo))))
+        pts.add(max(lo, min(hi, val)))
+    return sorted(pts)
+
+
+def generate_boundary_samples(effective_max_seqs, token_budget, max_model_len,
+                              config, edge_steps=8):
+    """生成边界样本: 角点 + 沿各轴的边扫描。
+
+    边界样本确保 RF 模型在参数空间边界有训练数据，避免外推失准。
+
+    生成策略:
+      角点: B, c, a 各取 {min, max} 的有效组合
+      边扫: 固定两个维度在极值，第三个维度 log 等间距扫描
+
+    Returns:
+        list of (layer_name, B, C, A) tuples, set of seen keys
+    """
+    max_B = effective_max_seqs
+    max_c = min(token_budget, max_model_len - 3)
+    max_a = max_model_len - 4  # c=1 时的 a 上限
+
+    samples = []
+    seen = set()
+
+    def _try_add(B, c, a):
+        C = B * c
+        A = B * a
+        key = (B, C, A)
+        if key in seen:
+            return
+        valid, _ = validate_params(B, C, A, config)
+        if not valid:
+            return
+        seen.add(key)
+        samples.append(("boundary", B, C, A))
+
+    # --- 角点: B × c × a 各取端值的合法组合 ---
+    B_corners = [1, max_B]
+    c_corners = [1, max_c]
+    a_corners = [0, 1, max_a]
+    for B in B_corners:
+        for c in c_corners:
+            # c 受 B 约束: c <= budget // B
+            actual_c = min(c, token_budget // B, max_model_len - 3)
+            if actual_c < 1:
+                continue
+            for a in a_corners:
+                # a 受 c 约束: a + c + 2 < max_model_len
+                actual_a = min(a, max_model_len - actual_c - 3)
+                if actual_a < 0:
+                    actual_a = 0
+                _try_add(B, actual_c, actual_a)
+
+    # --- 边扫: 沿 B 轴 (固定 c, a 在端值) ---
+    B_steps = _log_steps(1, max_B, edge_steps)
+    for B in B_steps:
+        _try_add(B, 1, 0)                                     # decode 最简
+        a_at_c1 = min(max_a, max_model_len - 1 - 3)
+        _try_add(B, 1, a_at_c1)                               # decode 最大 context
+        c_at_B = min(token_budget // B, max_model_len - 3)
+        if c_at_B >= 1:
+            _try_add(B, c_at_B, 0)                             # prefill 最大 c
+
+    # --- 边扫: 沿 c 轴 (固定 B=1, a 在端值) ---
+    c_steps = _log_steps(1, max_c, edge_steps)
+    for c in c_steps:
+        _try_add(1, c, 0)                                      # B=1, prefill
+        a_at_c = min(max_model_len - c - 3, max_a)
+        if a_at_c >= 1:
+            _try_add(1, c, a_at_c)                              # B=1, 最大 a
+
+    # --- 边扫: 沿 a 轴 (固定 B=1, c=1) ---
+    a_steps = _log_steps(1, max_a, edge_steps)
+    for a in a_steps:
+        _try_add(1, 1, a)                                       # B=1, decode 扫 context
+
+    # --- 边扫: 沿 a 轴 (固定 B=max_B, c=1) ---
+    for a in a_steps:
+        _try_add(max_B, 1, a)                                   # max_B, decode 扫 context
+
+    return samples, seen
+
+
+# ---- 主采样函数 ----
 
 def generate_random_bca_samples(num_samples, token_budget, max_num_seqs,
                                 max_model_len, kv_cache_tokens=None,
-                                max_concurrent_batches=2, seed=42):
-    """主采样函数: 分层采样 + reject sampling + validate + 去重。
+                                max_concurrent_batches=2, seed=42,
+                                prompt_len_margin=50):
+    """主采样函数: 边界样本 + 体积比例分配 + B 分层随机采样。
 
     Args:
         kv_cache_tokens: KV cache 总容量 (tokens)。若提供，则约束
@@ -161,9 +350,12 @@ def generate_random_bca_samples(num_samples, token_budget, max_num_seqs,
             可通过 num_gpu_blocks * block_size 计算得到。
         max_concurrent_batches: profile_step 的并发批次数，
             约束 B <= max_num_seqs // max_concurrent_batches。
+        prompt_len_margin: 每请求长度距理论上限的余量。
+            采样上界为 max_model_len - prompt_len_margin，
+            避免触碰极端边界。
 
     Returns:
-        list of (batch_size, compute_tokens, access_tokens) tuples
+        list of (layer_name, B, C, A) tuples
     """
     rng = random.Random(seed)
 
@@ -174,58 +366,73 @@ def generate_random_bca_samples(num_samples, token_budget, max_num_seqs,
         "max_concurrent_batches": max_concurrent_batches,
     }
     if kv_cache_tokens is not None:
-        # validate_params 通过 num_gpu_blocks * block_size 计算容量
-        # 这里用 block_size=1 使得 num_gpu_blocks 直接等于 token 数
         config["num_gpu_blocks"] = kv_cache_tokens
         config["block_size"] = 1
 
-    # B 的实际上界: validate_params 要求 max_concurrent * B <= max_num_seqs
+    # B 的实际上界
     effective_max_seqs = max_num_seqs // max_concurrent_batches
+    # 每批次可用的 KV cache 容量
+    kv_budget = kv_cache_tokens // max_concurrent_batches if kv_cache_tokens else None
+    # 采样用的模型长度上限 (留 margin 余量)
+    sampling_max_len = max_model_len - prompt_len_margin
 
-    # 层分配
+    # 1. 边界样本 (确保 RF 模型在边界有训练数据)
+    boundary_samples, seen = generate_boundary_samples(
+        effective_max_seqs, token_budget, sampling_max_len, config)
+
+    # 2. 按有效区域 log 体积分配配额
+    remaining = max(0, num_samples - len(boundary_samples))
+
+    volumes = _estimate_layer_volumes(
+        effective_max_seqs, sampling_max_len, token_budget, kv_budget,
+        kv_margin=prompt_len_margin)
+    total_vol = sum(volumes.values())
+
     layer_spec = [
-        ("decode", 0.40, sample_decode),
-        ("prefill", 0.20, sample_prefill),
-        ("chunked", 0.20, sample_chunked),
-        ("general", 0.20, sample_general),
+        ("decode", _decode_given_B),
+        ("prefill", _prefill_given_B),
+        ("chunked", _chunked_given_B),
     ]
 
-    all_samples = []  # list of (layer_name, B, C, A)
-    seen = set()
+    # Chunked 的 3D 体积远大于 2D 层，缩减权重以平衡覆盖密度
+    weights = dict(volumes)
+    weights["chunked"] = weights.get("chunked", 0) / 2
 
-    for layer_name, ratio, sampler in layer_spec:
-        target = max(1, round(num_samples * ratio))
-        collected = 0
-        attempts = 0
-        max_attempts = target * 50  # reject sampling 上限
+    # Largest-remainder 分配法，确保总数精确等于 remaining
+    total_weight = sum(weights.values())
+    if total_weight > 0:
+        raw = {name: remaining * weights[name] / total_weight for name in weights}
+    else:
+        raw = {name: remaining / len(layer_spec) for name in weights}
 
-        while collected < target and attempts < max_attempts:
-            attempts += 1
-            result = sampler(rng, effective_max_seqs, max_model_len, token_budget)
-            if result is None:
-                continue
-            B, C, A = result
+    allocations = {name: max(1, int(v)) for name, v in raw.items()}
+    alloc_remainder = remaining - sum(allocations.values())
+    frac_order = sorted(raw.keys(), key=lambda n: -(raw[n] - int(raw[n])))
+    for name in frac_order:
+        if alloc_remainder <= 0:
+            break
+        allocations[name] += 1
+        alloc_remainder -= 1
 
-            # 验证
-            valid, _ = validate_params(B, C, A, config)
-            if not valid:
-                continue
+    # 输出分配信息
+    print(f"  layer volumes: { {k: f'{v:.1f}' for k, v in volumes.items()} }")
+    print(f"  layer allocations: {allocations} (boundary={len(boundary_samples)})")
 
-            # 去重
-            key = (B, C, A)
-            if key in seen:
-                continue
-            seen.add(key)
+    # 3. B 分层随机采样
+    all_samples = list(boundary_samples)
 
-            all_samples.append((layer_name, B, C, A))
-            collected += 1
-
-        if collected < target:
-            print(f"Warning: {layer_name} layer only generated {collected}/{target} samples "
-                  f"after {attempts} attempts", file=sys.stderr)
+    for layer_name, sampler_given_B in layer_spec:
+        target = allocations.get(layer_name, 0)
+        layer_samples = _stratified_sample_layer(
+            layer_name, sampler_given_B, target, rng,
+            effective_max_seqs, sampling_max_len, token_budget,
+            kv_budget, config, seen, kv_margin=prompt_len_margin)
+        all_samples.extend(layer_samples)
 
     return all_samples
 
+
+# ---- 输出 ----
 
 def dump_yaml(samples, token_budget, max_num_seqs, max_model_len, seed,
               num_samples, output_path):
@@ -242,6 +449,7 @@ def dump_yaml(samples, token_budget, max_num_seqs, max_model_len, seed,
             "batch_size": B,
             "compute_tokens": C,
             "access_tokens": A,
+            "layer": layer_name,
         })
 
     # 构建完整 YAML 结构

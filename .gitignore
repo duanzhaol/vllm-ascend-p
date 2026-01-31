@@ -1,5 +1,8 @@
 *.csv
 config*.json
+*.png
+*.yaml
+
 ## vLLM Ascend Ignore
 # VSCode
 .vscode/

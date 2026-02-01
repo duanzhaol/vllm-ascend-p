@@ -45,11 +45,15 @@ def log_uniform_int(lo, hi, rng):
 
 # ---- 核心采样器 (接受固定 B) ----
 
-def _decode_given_B(B, rng, max_len, budget, kv_budget, kv_margin=0):
+def _decode_given_B(B, rng, max_len, budget, kv_budget, kv_margin=0,
+                    max_concurrent=2):
     """Decode: c=1 固定, 给定 B 采样 a。"""
     c = 1
     C = B * c
-    if C > budget:
+    num_groups = min(max_concurrent, B)
+    base, rem = divmod(B, num_groups)
+    max_gs = base + (1 if rem > 0 else 0)
+    if max_gs * c > budget:
         return None
     a_max = max_len - c - 3
     if kv_budget is not None:
@@ -60,9 +64,14 @@ def _decode_given_B(B, rng, max_len, budget, kv_budget, kv_margin=0):
     return (B, C, B * a)
 
 
-def _prefill_given_B(B, rng, max_len, budget, kv_budget, kv_margin=0):
+def _prefill_given_B(B, rng, max_len, budget, kv_budget, kv_margin=0,
+                     max_concurrent=2):
     """Prefill: a=0 固定, 给定 B 采样 c。"""
-    c_max = min(budget, budget // B, max_len - 3)
+    num_groups = min(max_concurrent, B)
+    base, rem = divmod(B, num_groups)
+    max_gs = base + (1 if rem > 0 else 0)
+    # per_step = max_gs * c ≤ budget → c ≤ budget // max_gs
+    c_max = min(budget // max_gs, max_len - 3)
     if kv_budget is not None:
         c_max = min(c_max, kv_budget // B - 2 - kv_margin)
     if c_max < 1:
@@ -71,9 +80,14 @@ def _prefill_given_B(B, rng, max_len, budget, kv_budget, kv_margin=0):
     return (B, B * c, 0)
 
 
-def _chunked_given_B(B, rng, max_len, budget, kv_budget, kv_margin=0):
+def _chunked_given_B(B, rng, max_len, budget, kv_budget, kv_margin=0,
+                     max_concurrent=2):
     """Chunked: c>=2, a>=1, 给定 B 采样 c 和 a。"""
-    c_max = min(budget, budget // B, max_len - 4)
+    num_groups = min(max_concurrent, B)
+    base, rem = divmod(B, num_groups)
+    max_gs = base + (1 if rem > 0 else 0)
+    # per_step = max_gs * c ≤ budget → c ≤ budget // max_gs
+    c_max = min(budget // max_gs, max_len - 4)
     if kv_budget is not None:
         # 留 a>=1 的空间: prompt_len = a+c+2 <= kv_budget//B - kv_margin
         c_max = min(c_max, kv_budget // B - 3 - kv_margin)
@@ -91,28 +105,35 @@ def _chunked_given_B(B, rng, max_len, budget, kv_budget, kv_margin=0):
 
 # ---- 公共采样接口 ----
 
-def sample_decode(rng, max_seqs, max_len, budget, kv_budget=None):
+def sample_decode(rng, max_seqs, max_len, budget, kv_budget=None,
+                  max_concurrent=2):
     """Decode: c=1 固定, a=log[1, a_max(B)]"""
     B = log_uniform_int(1, max_seqs, rng)
-    return _decode_given_B(B, rng, max_len, budget, kv_budget)
+    return _decode_given_B(B, rng, max_len, budget, kv_budget,
+                           max_concurrent=max_concurrent)
 
 
-def sample_prefill(rng, max_seqs, max_len, budget, kv_budget=None):
+def sample_prefill(rng, max_seqs, max_len, budget, kv_budget=None,
+                   max_concurrent=2):
     """Prefill: a=0 固定, c=log[1, c_max(B)]"""
     B = log_uniform_int(1, max_seqs, rng)
-    return _prefill_given_B(B, rng, max_len, budget, kv_budget)
+    return _prefill_given_B(B, rng, max_len, budget, kv_budget,
+                            max_concurrent=max_concurrent)
 
 
-def sample_chunked(rng, max_seqs, max_len, budget, kv_budget=None):
+def sample_chunked(rng, max_seqs, max_len, budget, kv_budget=None,
+                   max_concurrent=2):
     """Chunked: c>=2, a>=1"""
     B = log_uniform_int(1, max_seqs, rng)
-    return _chunked_given_B(B, rng, max_len, budget, kv_budget)
+    return _chunked_given_B(B, rng, max_len, budget, kv_budget,
+                            max_concurrent=max_concurrent)
 
 
 # ---- 有效区域 log 体积估算 ----
 
 def _estimate_layer_volumes(effective_max_seqs, max_model_len, token_budget,
-                            kv_budget, kv_margin=0, n_B=500, n_c=100):
+                            kv_budget, kv_margin=0, max_concurrent=2,
+                            n_B=500, n_c=100):
     """数值积分估算各层在 log 空间中的有效区域体积。
 
     Decode / Prefill 是 2D (log-B × log-a 或 log-c)。
@@ -136,6 +157,11 @@ def _estimate_layer_volumes(effective_max_seqs, max_model_len, token_budget,
         logB = log_B_lo + (i + 0.5) * dlogB
         B = max(1, round(math.exp(logB)))
 
+        # 计算当前 B 下的 max_group_size
+        num_groups = min(max_concurrent, B)
+        base, rem = divmod(B, num_groups)
+        max_gs = base + (1 if rem > 0 else 0)
+
         # Decode: c=1, a ∈ [1, a_max]
         a_max_d = max_model_len - 4
         if kv_budget is not None:
@@ -144,14 +170,15 @@ def _estimate_layer_volumes(effective_max_seqs, max_model_len, token_budget,
             vol_decode += math.log(a_max_d) * dlogB
 
         # Prefill: a=0, c ∈ [1, c_max]
-        c_max_p = min(token_budget, token_budget // max(B, 1), max_model_len - 3)
+        # per_step = max_gs * c ≤ token_budget → c ≤ token_budget // max_gs
+        c_max_p = min(token_budget // max_gs, max_model_len - 3)
         if kv_budget is not None:
             c_max_p = min(c_max_p, kv_budget // B - 2 - kv_margin)
         if c_max_p >= 1:
             vol_prefill += math.log(c_max_p) * dlogB
 
         # Chunked: c ∈ [2, c_max], a ∈ [1, a_max(c)]
-        c_max_ch = min(token_budget, token_budget // max(B, 1), max_model_len - 4)
+        c_max_ch = min(token_budget // max_gs, max_model_len - 4)
         if kv_budget is not None:
             c_max_ch = min(c_max_ch, kv_budget // B - 3 - kv_margin)
         if c_max_ch >= 2:
@@ -175,7 +202,7 @@ def _estimate_layer_volumes(effective_max_seqs, max_model_len, token_budget,
 def _stratified_sample_layer(layer_name, sampler_given_B, target, rng,
                               effective_max_seqs, max_model_len, token_budget,
                               kv_budget, config, seen, kv_margin=0,
-                              n_strata=None):
+                              max_concurrent=2, n_strata=None):
     """在 log-B 上分层抽样，确保 B 维度覆盖均匀。
 
     将 [1, effective_max_seqs] 的 log 范围等分为 n_strata 段，
@@ -218,7 +245,9 @@ def _stratified_sample_layer(layer_name, sampler_given_B, target, rng,
         while collected < stratum_target and attempts < max_attempts:
             attempts += 1
             B = log_uniform_int(B_lo, B_hi, rng)
-            result = sampler_given_B(B, rng, max_model_len, token_budget, kv_budget, kv_margin)
+            result = sampler_given_B(B, rng, max_model_len, token_budget,
+                                     kv_budget, kv_margin,
+                                     max_concurrent=max_concurrent)
             if result is None:
                 continue
             _, C, A = result
@@ -258,7 +287,7 @@ def _log_steps(lo, hi, n):
 
 
 def generate_boundary_samples(effective_max_seqs, token_budget, max_model_len,
-                              config, edge_steps=8):
+                              config, max_concurrent=2, edge_steps=8):
     """生成边界样本: 角点 + 沿各轴的边扫描。
 
     边界样本确保 RF 模型在参数空间边界有训练数据，避免外推失准。
@@ -289,14 +318,20 @@ def generate_boundary_samples(effective_max_seqs, token_budget, max_model_len,
         seen.add(key)
         samples.append(("boundary", B, C, A))
 
+    def _max_gs(B):
+        """计算给定 B 下的 max_group_size（复制 server divmod 逻辑）。"""
+        ng = min(max_concurrent, B)
+        base, rem = divmod(B, ng)
+        return base + (1 if rem > 0 else 0)
+
     # --- 角点: B × c × a 各取端值的合法组合 ---
     B_corners = [1, max_B]
     c_corners = [1, max_c]
     a_corners = [0, 1, max_a]
     for B in B_corners:
         for c in c_corners:
-            # c 受 B 约束: c <= budget // B
-            actual_c = min(c, token_budget // B, max_model_len - 3)
+            # c 受 B 约束: per_step = max_gs * c ≤ budget
+            actual_c = min(c, token_budget // _max_gs(B), max_model_len - 3)
             if actual_c < 1:
                 continue
             for a in a_corners:
@@ -312,7 +347,7 @@ def generate_boundary_samples(effective_max_seqs, token_budget, max_model_len,
         _try_add(B, 1, 0)                                     # decode 最简
         a_at_c1 = min(max_a, max_model_len - 1 - 3)
         _try_add(B, 1, a_at_c1)                               # decode 最大 context
-        c_at_B = min(token_budget // B, max_model_len - 3)
+        c_at_B = min(token_budget // _max_gs(B), max_model_len - 3)
         if c_at_B >= 1:
             _try_add(B, c_at_B, 0)                             # prefill 最大 c
 
@@ -346,10 +381,10 @@ def generate_random_bca_samples(num_samples, token_budget, max_num_seqs,
 
     Args:
         kv_cache_tokens: KV cache 总容量 (tokens)。若提供，则约束
-            max_concurrent * B * prompt_len <= kv_cache_tokens。
+            B * prompt_len <= kv_cache_tokens。
             可通过 num_gpu_blocks * block_size 计算得到。
         max_concurrent_batches: profile_step 的并发批次数，
-            约束 B <= max_num_seqs // max_concurrent_batches。
+            用于 divmod 分发计算 per-step budget 约束。
         prompt_len_margin: 每请求长度距理论上限的余量。
             采样上界为 max_model_len - prompt_len_margin，
             避免触碰极端边界。
@@ -369,23 +404,24 @@ def generate_random_bca_samples(num_samples, token_budget, max_num_seqs,
         config["num_gpu_blocks"] = kv_cache_tokens
         config["block_size"] = 1
 
-    # B 的实际上界
-    effective_max_seqs = max_num_seqs // max_concurrent_batches
-    # 每批次可用的 KV cache 容量
-    kv_budget = kv_cache_tokens // max_concurrent_batches if kv_cache_tokens else None
+    # B 的实际上界（total 语义：B 就是总请求数，不需要除以 max_concurrent）
+    effective_max_seqs = max_num_seqs
+    # KV cache 总容量（total 语义：不需要除以 max_concurrent）
+    kv_budget = kv_cache_tokens
     # 采样用的模型长度上限 (留 margin 余量)
     sampling_max_len = max_model_len - prompt_len_margin
 
     # 1. 边界样本 (确保 RF 模型在边界有训练数据)
     boundary_samples, seen = generate_boundary_samples(
-        effective_max_seqs, token_budget, sampling_max_len, config)
+        effective_max_seqs, token_budget, sampling_max_len, config,
+        max_concurrent=max_concurrent_batches)
 
     # 2. 按有效区域 log 体积分配配额
     remaining = max(0, num_samples - len(boundary_samples))
 
     volumes = _estimate_layer_volumes(
         effective_max_seqs, sampling_max_len, token_budget, kv_budget,
-        kv_margin=prompt_len_margin)
+        kv_margin=prompt_len_margin, max_concurrent=max_concurrent_batches)
     total_vol = sum(volumes.values())
 
     layer_spec = [
@@ -426,7 +462,8 @@ def generate_random_bca_samples(num_samples, token_budget, max_num_seqs,
         layer_samples = _stratified_sample_layer(
             layer_name, sampler_given_B, target, rng,
             effective_max_seqs, sampling_max_len, token_budget,
-            kv_budget, config, seen, kv_margin=prompt_len_margin)
+            kv_budget, config, seen, kv_margin=prompt_len_margin,
+            max_concurrent=max_concurrent_batches)
         all_samples.extend(layer_samples)
 
     return all_samples
@@ -435,7 +472,8 @@ def generate_random_bca_samples(num_samples, token_budget, max_num_seqs,
 # ---- 输出 ----
 
 def dump_yaml(samples, token_budget, max_num_seqs, max_model_len, seed,
-              num_samples, output_path):
+              num_samples, output_path, max_concurrent_batches=2,
+              kv_cache_tokens=None):
     """将采样结果导出为 YAML 文件。"""
     # 按层分组
     layers = {}
@@ -457,8 +495,11 @@ def dump_yaml(samples, token_budget, max_num_seqs, max_model_len, seed,
         "token_budget": token_budget,
         "max_num_seqs": max_num_seqs,
         "max_model_len": max_model_len,
-        "test_cases": test_cases,
+        "max_concurrent_batches": max_concurrent_batches,
     }
+    if kv_cache_tokens is not None:
+        doc["kv_cache_tokens"] = kv_cache_tokens
+    doc["test_cases"] = test_cases
 
     # 构建 header 注释
     layer_counts = {}
@@ -470,7 +511,8 @@ def dump_yaml(samples, token_budget, max_num_seqs, max_model_len, seed,
         f"# Auto-generated BCA samples for RF training",
         f"# seed: {seed}, num_samples: {num_samples}, actual: {len(samples)}",
         f"# constraints: token_budget={token_budget}, max_num_seqs={max_num_seqs}, "
-        f"max_model_len={max_model_len}",
+        f"max_model_len={max_model_len}, max_concurrent_batches={max_concurrent_batches}, "
+        f"kv_cache_tokens={kv_cache_tokens}",
         f"# layer distribution: {layer_summary}",
         "",
     ]
@@ -559,8 +601,14 @@ Example usage:
     parser.add_argument(
         "--kv-cache-tokens", type=int, default=None,
         help="Total KV cache capacity in tokens (= num_gpu_blocks * block_size). "
-             "Constrains max_concurrent * B * prompt_len <= kv_cache_tokens. "
+             "Constrains B * prompt_len <= kv_cache_tokens. "
              "If not set, KV cache capacity check is skipped.",
+    )
+    parser.add_argument(
+        "--max-concurrent-batches", type=int, default=2,
+        dest="max_concurrent_batches",
+        help="Number of concurrent pipeline batches (typically = PP size). "
+             "Used for divmod distribution to compute per-step budget. (default: 2)",
     )
     parser.add_argument(
         "-o", "--output", type=str, default="bca_workloads.yaml",
@@ -571,7 +619,8 @@ Example usage:
 
     print(f"Generating {args.num_samples} BCA samples...")
     print(f"  token_budget={args.token_budget}, max_num_seqs={args.max_num_seqs}, "
-          f"max_model_len={args.max_model_len}, kv_cache_tokens={args.kv_cache_tokens}")
+          f"max_model_len={args.max_model_len}, kv_cache_tokens={args.kv_cache_tokens}, "
+          f"max_concurrent_batches={args.max_concurrent_batches}")
     print(f"  seed={args.seed}")
 
     samples = generate_random_bca_samples(
@@ -580,6 +629,7 @@ Example usage:
         max_num_seqs=args.max_num_seqs,
         max_model_len=args.max_model_len,
         kv_cache_tokens=args.kv_cache_tokens,
+        max_concurrent_batches=args.max_concurrent_batches,
         seed=args.seed,
     )
 
@@ -593,6 +643,8 @@ Example usage:
         seed=args.seed,
         num_samples=args.num_samples,
         output_path=args.output,
+        max_concurrent_batches=args.max_concurrent_batches,
+        kv_cache_tokens=args.kv_cache_tokens,
     )
     print(f"Written {len(samples)} test cases to {output_path}")
 

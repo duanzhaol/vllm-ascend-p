@@ -123,6 +123,7 @@ def generate_test_configs(
 
     max_num_seqs = config.get("max_num_seqs", 128)
     token_budget = config.get("token_budget", 2048)
+    max_concurrent = config.get("max_concurrent_batches", 2) if config else 2
 
     # 生成候选配置
     batch_sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256]
@@ -133,9 +134,14 @@ def generate_test_configs(
     for bs in batch_sizes:
         if bs > max_num_seqs:
             continue
+        # 计算 per-step 的最大 group size（复制 server divmod 逻辑）
+        num_groups_bs = min(max_concurrent, bs)
+        base_bs, rem_bs = divmod(bs, num_groups_bs)
+        max_gs_bs = base_bs + (1 if rem_bs > 0 else 0)
         for cpr in compute_per_req:
             ct = bs * cpr
-            if ct > token_budget:
+            per_step_ct = max_gs_bs * cpr
+            if per_step_ct > token_budget:
                 continue
             for apr in access_per_req:
                 at = bs * apr

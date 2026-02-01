@@ -334,6 +334,104 @@ async def profile_batch(request: Request) -> JSONResponse:
         )
 
 
+@profiling_router.post("/profile_step_batch")
+async def profile_step_batch(request: Request) -> JSONResponse:
+    """
+    Batch profile: group samples by B, prefill once per group,
+    then iterate over (C, A) pairs reusing the same KV cache.
+
+    This is significantly faster than calling /profile_step individually
+    for each sample because KV cache filling is done only once per B group.
+
+    Request body:
+        {
+            "samples": [[B1, C1, A1], [B2, C2, A2], ...],
+            "num_iterations": int (default: 20),
+            "warmup_iterations": int (default: 5)
+        }
+
+    Returns:
+        List of result dicts, one per sample, in the same order as input.
+    """
+    try:
+        request_dict = await request.json()
+        engine_client = get_engine_client(request)
+
+        samples = request_dict.get("samples")
+        num_iterations = request_dict.get("num_iterations", 20)
+        warmup_iterations = request_dict.get("warmup_iterations", 5)
+
+        if samples is None or not isinstance(samples, list):
+            return JSONResponse(
+                {"error": "samples is required and must be a list of [B, C, A] triples"},
+                status_code=400
+            )
+
+        if len(samples) == 0:
+            return JSONResponse(
+                {"error": "samples must not be empty"},
+                status_code=400
+            )
+
+        # Validate each sample
+        for i, sample in enumerate(samples):
+            if not isinstance(sample, (list, tuple)) or len(sample) != 3:
+                return JSONResponse(
+                    {"error": f"samples[{i}] must be a list of 3 integers [B, C, A]"},
+                    status_code=400
+                )
+            B, C, A = sample
+            if not isinstance(B, int) or not isinstance(C, int) or not isinstance(A, int):
+                return JSONResponse(
+                    {"error": f"samples[{i}] values must be integers"},
+                    status_code=400
+                )
+            if B <= 0:
+                return JSONResponse(
+                    {"error": f"samples[{i}]: batch_size must be positive"},
+                    status_code=400
+                )
+            if C <= 0:
+                return JSONResponse(
+                    {"error": f"samples[{i}]: compute_tokens must be positive"},
+                    status_code=400
+                )
+            if A < 0:
+                return JSONResponse(
+                    {"error": f"samples[{i}]: access_tokens must be non-negative"},
+                    status_code=400
+                )
+
+        logger.info(
+            f"Starting profile_step_batch: {len(samples)} samples, "
+            f"num_iterations={num_iterations}, warmup_iterations={warmup_iterations}"
+        )
+
+        if hasattr(engine_client, 'profile_step_batch'):
+            results = await engine_client.profile_step_batch(
+                samples=samples,
+                num_iterations=num_iterations,
+                warmup_iterations=warmup_iterations,
+            )
+        else:
+            return JSONResponse(
+                {"error": "Engine does not support profile_step_batch"},
+                status_code=500
+            )
+
+        logger.info(f"Profile step batch completed: {len(results)} results")
+        return JSONResponse(results)
+
+    except Exception as e:
+        logger.error(f"Profile step batch failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return JSONResponse(
+            {"error": str(e)},
+            status_code=500
+        )
+
+
 @profiling_router.post("/profile_step")
 async def profile_step(request: Request) -> JSONResponse:
     """

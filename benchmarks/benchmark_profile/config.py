@@ -64,17 +64,24 @@ def validate_params(
         num_gpu_blocks = config.get("num_gpu_blocks", float("inf"))
         block_size = config.get("block_size", 16)
 
-        # profile_step 会创建 max_concurrent 组请求
-        max_concurrent = config.get("max_concurrent_batches", 2)
-        total_requests = max_concurrent * batch_size
-        if total_requests > max_num_seqs:
+        # batch_size 是所有 pipeline group 的请求总数
+        if batch_size > max_num_seqs:
             return False, (
-                f"总请求数({total_requests} = {max_concurrent} × {batch_size}) "
-                f"超过 max_num_seqs ({max_num_seqs})"
+                f"batch_size ({batch_size}) 超过 max_num_seqs ({max_num_seqs})"
             )
 
-        if compute_tokens > token_budget:
-            return False, f"compute_tokens 超过 token_budget ({token_budget})"
+        # 计算 per-step compute tokens（复制 server 的 divmod 分发逻辑）
+        max_concurrent = config.get("max_concurrent_batches", 2)
+        num_groups = min(max_concurrent, batch_size)
+        base_size, remainder = divmod(batch_size, num_groups)
+        max_group_size = base_size + (1 if remainder > 0 else 0)
+        compute_per_request = compute_tokens // batch_size
+        per_step_compute = max_group_size * compute_per_request
+        if per_step_compute > token_budget:
+            return False, (
+                f"per_step_compute ({per_step_compute}) "
+                f"超过 token_budget ({token_budget})"
+            )
 
         # prompt_len = access_per_request + compute_per_request + 2
         prompt_len = (access_tokens + compute_tokens) // batch_size + 2
@@ -82,9 +89,8 @@ def validate_params(
             return False, f"prompt_len ({prompt_len}) 超过 max_model_len"
 
         # KV cache 容量验证
-        # 需要 max_concurrent_batches * batch_size * prompt_len 个 token
-        # 这里假设 max_concurrent_batches = 2 (保守估计)
-        total_kv_tokens = max_concurrent * batch_size * prompt_len
+        # batch_size 已是总请求数，不需要再乘 max_concurrent
+        total_kv_tokens = batch_size * prompt_len
         kv_capacity = num_gpu_blocks * block_size
         if total_kv_tokens > kv_capacity:
             return False, f"KV cache 容量不足 (需要 {total_kv_tokens}, 容量 {kv_capacity})"

@@ -11,7 +11,7 @@ from typing import Any
 from .config import load_config, validate_params
 from .data_generator import generate_test_configs
 from .profiler import run_profile_step, write_result_to_csv
-from .request import init_url
+from .request import init_url, send_profile_step_batch
 
 
 def check_port(host: str, port: int) -> bool:
@@ -68,7 +68,9 @@ async def run_batch_tests(
     args: argparse.Namespace,
     config: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    """运行批量测试"""
+    """运行批量测试（按 B 分组调用 batch API，每组完成后立即输出）"""
+    from collections import defaultdict
+
     # 生成测试配置
     test_configs = generate_test_configs(
         config=config,
@@ -89,41 +91,91 @@ async def run_batch_tests(
             valid_configs.append((batch_size, compute_tokens, access_tokens))
         else:
             skipped_count += 1
-            print(f"[{i+1}/{len(test_configs)}] [跳过] "
-                  f"batch_size={batch_size}, "
-                  f"compute_tokens={compute_tokens}, "
-                  f"access_tokens={access_tokens}")
-            print(f"  原因: {error_msg}")
+            print(f"[跳过] B={batch_size} C={compute_tokens} A={access_tokens}"
+                  f"  原因: {error_msg}")
 
     print(f"\n验证完成: {len(valid_configs)} 个有效, {skipped_count} 个跳过")
-    print(f"将运行 {len(valid_configs)} 个有效配置")
+
+    if not valid_configs:
+        return []
+
+    # 按 B 分组（保持原始顺序）
+    groups: dict[int, list[tuple[int, int, int]]] = defaultdict(list)
+    for batch_size, compute_tokens, access_tokens in valid_configs:
+        groups[batch_size].append((batch_size, compute_tokens, access_tokens))
+
+    sorted_bs = sorted(groups.keys())
+    print(f"共 {len(sorted_bs)} 个 B 分组: {sorted_bs}\n")
 
     results = []
+    done = 0
+    failed = 0
+    total = len(valid_configs)
     write_header = not os.path.exists(args.output_file)
 
-    for i, (batch_size, compute_tokens, access_tokens) in enumerate(valid_configs):
-        print(f"\n[{i+1}/{len(valid_configs)}] "
-              f"batch_size={batch_size}, "
-              f"compute_tokens={compute_tokens}, "
-              f"access_tokens={access_tokens}")
+    for B in sorted_bs:
+        group = groups[B]
+        samples = [[b, c, a] for b, c, a in group]
 
-        result = await run_profile_step(
-            batch_size=batch_size,
-            compute_tokens=compute_tokens,
-            access_tokens=access_tokens,
+        print(f"--- B={B} ({len(group)} samples) ---")
+        group_results = await send_profile_step_batch(
+            samples=samples,
             num_iterations=args.num_iterations,
             warmup_iterations=args.warmup_iterations,
         )
 
-        if result:
-            print(f"  -> avg_step_time_ms: {result['avg_step_time_ms']:.3f}")
-            results.append(result)
+        if group_results is not None and isinstance(group_results, list) \
+                and len(group_results) == len(group):
+            # 输出该组的 KV cache 填充时间（从第一个成功结果取）
+            for r in group_results:
+                if r and "kv_fill_time_s" in r:
+                    print(f"  KV fill: {r['kv_fill_time_s']:.3f}s")
+                    break
 
-            # 写入 CSV
-            write_result_to_csv(result, args.output_file, write_header)
-            write_header = False
+            for j, result in enumerate(group_results):
+                done += 1
+                _, ct, at = group[j]
+                tag = f"[{done}/{total}]"
+                if result and "error" not in result:
+                    avg = result['avg_step_time_ms']
+                    st = result.get('sample_time_s', 0)
+                    print(f"  {tag} B={B:<4d} C={ct:<6d} A={at:<8d}"
+                          f"  {avg:.3f} ms  ({st:.1f}s)")
+                    results.append(result)
+                    write_result_to_csv(result, args.output_file, write_header)
+                    write_header = False
+                else:
+                    failed += 1
+                    err = result.get("error", "unknown") if result else "null"
+                    print(f"  {tag} B={B:<4d} C={ct:<6d} A={at:<8d}"
+                          f"  FAILED ({err})")
         else:
-            print("  -> 测试失败")
+            # batch API 对该组失败，逐个回退
+            print(f"  B={B} batch 失败，回退逐个调用")
+            for j, (bs, ct, at) in enumerate(group):
+                done += 1
+                result = await run_profile_step(
+                    batch_size=bs,
+                    compute_tokens=ct,
+                    access_tokens=at,
+                    num_iterations=args.num_iterations,
+                    warmup_iterations=args.warmup_iterations,
+                )
+                tag = f"[{done}/{total}]"
+                if result:
+                    avg = result['avg_step_time_ms']
+                    print(f"  {tag} B={bs:<4d} C={ct:<6d} A={at:<8d}"
+                          f"  {avg:.3f} ms")
+                    results.append(result)
+                    write_result_to_csv(result, args.output_file, write_header)
+                    write_header = False
+                else:
+                    failed += 1
+                    print(f"  {tag} B={bs:<4d} C={ct:<6d} A={at:<8d}"
+                          f"  FAILED")
+
+    if failed:
+        print(f"\n{failed} 个测试失败")
 
     return results
 
@@ -170,18 +222,19 @@ async def main():
     parser.add_argument("--num-iterations", type=int, default=20, help="测量迭代次数")
     parser.add_argument("--warmup-iterations", type=int, default=5, help="预热迭代次数")
 
-    # 服务器限制参数（用于 client 端验证，默认值与 vLLM 一致）
+    # 服务器限制参数（用于 client 端验证）
+    # 优先使用命令行指定的值，否则从配置文件读取，最后使用默认值
     parser.add_argument(
         "--max-num-batched-tokens",
         type=int,
-        default=2048,
-        help="服务器的 max_num_batched_tokens 限制 (默认: 2048)"
+        default=None,
+        help="服务器的 max_num_batched_tokens 限制 (默认: 配置文件值或 2048)"
     )
     parser.add_argument(
         "--max-num-seqs",
         type=int,
-        default=128,
-        help="服务器的 max_num_seqs 限制 (默认: 128)"
+        default=None,
+        help="服务器的 max_num_seqs 限制 (默认: 配置文件值或 128)"
     )
     parser.add_argument(
         "--max-model-len",
@@ -194,8 +247,17 @@ async def main():
         type=int,
         default=None,
         help="KV cache 总容量 (tokens, = num_gpu_blocks * block_size)。"
-             "约束 max_concurrent * B * prompt_len <= kv_cache_tokens。"
+             "约束 B * prompt_len <= kv_cache_tokens。"
              "若不设置则跳过 KV cache 容量检查。"
+    )
+    parser.add_argument(
+        "--max-concurrent-batches",
+        type=int,
+        default=None,
+        dest="max_concurrent_batches",
+        help="并发 pipeline 批次数 (通常 = PP size)。"
+             "用于 divmod 分发计算 per-step budget 约束。"
+             "若不设置，优先从配置文件读取，否则默认 2。"
     )
 
     # 输出
@@ -223,13 +285,28 @@ async def main():
     if args.config:
         config = load_config(args.config)
 
-    # 将命令行指定的服务器限制添加到 config 中
-    config["token_budget"] = args.max_num_batched_tokens
-    config["max_num_seqs"] = args.max_num_seqs
+    # 合并服务器限制参数：命令行 > 配置文件 > 默认值
+    if args.max_num_batched_tokens is not None:
+        config["token_budget"] = args.max_num_batched_tokens
+    elif "token_budget" not in config:
+        config["token_budget"] = 2048
+
+    if args.max_num_seqs is not None:
+        config["max_num_seqs"] = args.max_num_seqs
+    elif "max_num_seqs" not in config:
+        config["max_num_seqs"] = 128
+
     if args.max_model_len is not None:
         config["max_model_len"] = args.max_model_len
+
+    if args.max_concurrent_batches is not None:
+        config["max_concurrent_batches"] = args.max_concurrent_batches
+
     if args.kv_cache_tokens is not None:
         config["num_gpu_blocks"] = args.kv_cache_tokens
+        config["block_size"] = 1
+    elif "kv_cache_tokens" in config:
+        config["num_gpu_blocks"] = config["kv_cache_tokens"]
         config["block_size"] = 1
 
     if is_single_test:

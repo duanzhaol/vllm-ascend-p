@@ -847,6 +847,28 @@ class AsyncLLM(EngineClient):
             num_iterations, warmup_iterations
         )
 
+    async def profile_step_batch(
+        self,
+        samples: list[list[int]],
+        num_iterations: int = 20,
+        warmup_iterations: int = 5,
+    ) -> list[dict]:
+        """
+        Batch profile: group samples by B, prefill once per group,
+        then iterate over (C, A) pairs reusing the same KV cache.
+
+        Args:
+            samples: List of [B, C, A] triples.
+            num_iterations: Number of measurement iterations per sample.
+            warmup_iterations: Number of warmup iterations per sample.
+
+        Returns:
+            List of result dicts, one per sample, in the same order.
+        """
+        return await self.engine_core.profile_step_batch_async(
+            samples, num_iterations, warmup_iterations
+        )
+
     async def wait_for_requests_to_drain(self, drain_timeout: int = 300):
         """Wait for all requests to be drained."""
         start_time = time.time()

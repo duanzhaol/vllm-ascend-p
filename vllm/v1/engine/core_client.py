@@ -284,6 +284,22 @@ class EngineCoreClient(ABC):
     ) -> dict:
         raise NotImplementedError
 
+    def profile_step_batch(
+        self,
+        samples: list[list[int]],
+        num_iterations: int = 20,
+        warmup_iterations: int = 5,
+    ) -> list[dict]:
+        raise NotImplementedError
+
+    async def profile_step_batch_async(
+        self,
+        samples: list[list[int]],
+        num_iterations: int = 20,
+        warmup_iterations: int = 5,
+    ) -> list[dict]:
+        raise NotImplementedError
+
     async def collective_rpc_async(
         self,
         method: str | Callable[..., _R],
@@ -391,6 +407,16 @@ class InprocClient(EngineCoreClient):
         return self.engine_core.profile_step(
             batch_size, compute_tokens, access_tokens,
             num_iterations, warmup_iterations
+        )
+
+    def profile_step_batch(
+        self,
+        samples: list[list[int]],
+        num_iterations: int = 20,
+        warmup_iterations: int = 5,
+    ) -> list[dict]:
+        return self.engine_core.profile_step_batch(
+            samples, num_iterations, warmup_iterations
         )
 
     def collective_rpc(
@@ -896,6 +922,16 @@ class SyncMPClient(MPClient):
             num_iterations, warmup_iterations
         )
 
+    def profile_step_batch(
+        self,
+        samples: list[list[int]],
+        num_iterations: int = 20,
+        warmup_iterations: int = 5,
+    ) -> list[dict]:
+        return self.call_utility(
+            "profile_step_batch", samples, num_iterations, warmup_iterations
+        )
+
 
 class AsyncMPClient(MPClient):
     """Asyncio-compatible client for multi-proc EngineCore."""
@@ -1119,6 +1155,16 @@ class AsyncMPClient(MPClient):
         return await self.call_utility_async(
             "profile_step", batch_size, compute_tokens, access_tokens,
             num_iterations, warmup_iterations
+        )
+
+    async def profile_step_batch_async(
+        self,
+        samples: list[list[int]],
+        num_iterations: int = 20,
+        warmup_iterations: int = 5,
+    ) -> list[dict]:
+        return await self.call_utility_async(
+            "profile_step_batch", samples, num_iterations, warmup_iterations
         )
 
     async def collective_rpc_async(

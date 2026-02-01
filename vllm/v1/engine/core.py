@@ -778,21 +778,22 @@ class EngineCore:
             self.model_executor.max_concurrent_batches if use_batch_queue else 1
         )
 
-        # Distribute batch across pipeline groups.
-        # Each group has per_group_batch_size requests; total = batch_size.
-        if max_concurrent > 1 and batch_size % max_concurrent != 0:
-            raise ValueError(
-                f"batch_size ({batch_size}) must be divisible by "
-                f"max_concurrent_batches ({max_concurrent})"
-            )
-        per_group_batch_size = batch_size // max_concurrent
+        # Distribute batch across pipeline groups as evenly as possible.
+        # If batch_size < max_concurrent, use fewer groups.
+        num_groups = min(max_concurrent, batch_size)
+        base_size, remainder = divmod(batch_size, num_groups)
+        group_sizes = [
+            base_size + (1 if g < remainder else 0)
+            for g in range(num_groups)
+        ]
 
         access_per_request = access_tokens // batch_size
         compute_per_request = compute_tokens // batch_size
         # Prompt length = access_per_request + compute_per_request
         # This ensures num_new_tokens = prompt_len - access_per_request = compute_per_request
         prompt_len = access_per_request + compute_per_request
-        per_step_compute_tokens = per_group_batch_size * compute_per_request
+        max_group_size = max(group_sizes)
+        per_step_compute_tokens = max_group_size * compute_per_request
 
         # Save original config before any modifications
         original_threshold = (
@@ -811,27 +812,40 @@ class EngineCore:
             # ==================== Parameter Validation ====================
             self._validate_profile_step_params(
                 batch_size, compute_tokens, access_tokens,
-                prompt_len, max_concurrent, compute_per_request,
-                per_group_batch_size, per_step_compute_tokens,
+                prompt_len, compute_per_request,
+                per_step_compute_tokens,
             )
 
             # Get special token IDs to exclude from random generation
             special_token_ids = self._get_special_token_ids()
 
             # ==================== Phase 1: Create Requests and Fill KV Cache ====================
-            # Calculate max_tokens needed: each request is scheduled once per max_concurrent steps
+            # Calculate max_tokens needed: each request is scheduled once per num_groups steps
             # Total steps = pipeline_fill + warmup + measurement + 1
             # Each request needs enough tokens to not finish during profiling
-            pipeline_fill_steps = max_concurrent - 1
+            pipeline_fill_steps = num_groups - 1
             total_steps = pipeline_fill_steps + warmup_iterations + num_iterations + 1
-            # Each request is scheduled total_steps / max_concurrent times (rounded up)
-            profiling_tokens = (total_steps + max_concurrent - 1) // max_concurrent
-            # During KV fill, requests generate tokens while waiting for other requests
-            # to complete their prefill. First request in a group completes early and
-            # generates decode tokens while subsequent requests are still prefilling.
-            # Estimate: each request may generate up to 2*batch_size tokens during KV fill
-            kv_fill_tokens = batch_size * 2 * max_concurrent
-            max_tokens_needed = profiling_tokens + kv_fill_tokens + 20
+            # Each request is scheduled total_steps / num_groups times (rounded up)
+            profiling_tokens = (total_steps + num_groups - 1) // num_groups
+            # During KV fill, groups are filled one at a time (core.py:889-894).
+            # Within each group, the scheduler processes requests sequentially
+            # (long_prefill_token_threshold=0 gives the entire budget to one
+            # request). Early-finishing requests generate 1 decode output token
+            # per step while later requests are still prefilling.
+            # A request only generates output tokens during its own group's
+            # fill (the group is deactivated before the next group starts).
+            # Safe upper bound: max_group_size * steps_per_request.
+            token_budget = (
+                self.vllm_config.scheduler_config.max_num_batched_tokens
+            )
+            if prompt_len > 0 and token_budget > 0:
+                steps_per_request = (
+                    (prompt_len + token_budget - 1) // token_budget
+                )
+                kv_fill_tokens = max(group_sizes) * steps_per_request
+            else:
+                kv_fill_tokens = 0
+            max_tokens_needed = profiling_tokens + kv_fill_tokens + 100
             sampling_params = SamplingParams(
                 max_tokens=max_tokens_needed,
                 temperature=0.0,
@@ -840,15 +854,15 @@ class EngineCore:
             )
 
             logger.debug(
-                "[DEBUG] KV fill phase: creating %d groups × %d requests, "
+                "[DEBUG] KV fill phase: creating %d groups (sizes=%s), "
                 "prompt_len=%d, access_per_request=%d",
-                max_concurrent, per_group_batch_size, prompt_len, access_per_request,
+                num_groups, group_sizes, prompt_len, access_per_request,
             )
 
-            for group_idx in range(max_concurrent):
+            for group_idx in range(num_groups):
                 # Create a group of requests with random tokens
                 group_request_ids = []
-                for i in range(per_group_batch_size):
+                for i in range(group_sizes[group_idx]):
                     request_id = f"profile_step_g{group_idx}_{uuid.uuid4().hex[:8]}_{i}"
                     # Use local RNG to avoid polluting global random state
                     rng = random.Random(hash(request_id))
@@ -871,15 +885,21 @@ class EngineCore:
 
                 request_groups.append(group_request_ids)
 
-                # Fill KV cache for this group (using synchronous execution)
+                # Fast fill: allocate KV blocks via schedule() only,
+                # skipping execute_model(). This avoids generating
+                # unwanted decode tokens for early-finishing requests,
+                # which could cause them to hit max_tokens and be
+                # removed from the scheduler.
                 if access_per_request > 0:
-                    self._fill_kv_cache_for_group(group_request_ids, access_per_request)
+                    self._fast_fill_kv_cache_for_group(
+                        group_request_ids, access_per_request
+                    )
 
                 # Deactivate this group (set num_computed_tokens = num_tokens)
                 self._deactivate_profile_group(group_request_ids)
                 logger.debug(
                     "[DEBUG] KV fill: group g%d completed (%d/%d)",
-                    group_idx, group_idx + 1, max_concurrent,
+                    group_idx, group_idx + 1, num_groups,
                 )
 
             # ==================== Modify Scheduler Config ====================
@@ -893,24 +913,24 @@ class EngineCore:
             logger.debug(
                 "[DEBUG] Profiling phase: %d groups ready, "
                 "warmup=%d, iterations=%d",
-                max_concurrent, warmup_iterations, num_iterations,
+                num_groups, warmup_iterations, num_iterations,
             )
-            if use_batch_queue:
-                # PP > 1 or async_scheduling: use batch_queue mode
+            use_pipeline = use_batch_queue and num_groups > 1
+            if use_pipeline:
+                # Multiple groups: use pipeline mode
                 step_times = self._profile_step_with_batch_queue(
                     request_groups=request_groups,
                     access_per_request=access_per_request,
                     compute_per_request=compute_per_request,
-                    compute_tokens=per_step_compute_tokens,
+                    group_sizes=group_sizes,
                     prompt_len=prompt_len,
-                    max_concurrent=max_concurrent,
                     num_iterations=num_iterations,
                     warmup_iterations=warmup_iterations,
                 )
             else:
-                # PP = 1 without async_scheduling: use sync mode
+                # Single group: use sync mode
                 step_times = self._profile_step_sync(
-                    request_ids=request_groups[0],  # Only 1 group in sync mode
+                    request_ids=request_groups[0],
                     access_per_request=access_per_request,
                     compute_per_request=compute_per_request,
                     compute_tokens=per_step_compute_tokens,
@@ -940,7 +960,7 @@ class EngineCore:
                 "num_iterations": num_iterations,
                 "warmup_iterations": warmup_iterations,
                 "max_concurrent_batches": max_concurrent,
-                "execution_mode": "batch_queue" if use_batch_queue else "sync",
+                "execution_mode": "pipeline" if use_pipeline else "sync",
                 "pp_size": self.vllm_config.parallel_config.pipeline_parallel_size,
                 "tp_size": self.vllm_config.parallel_config.tensor_parallel_size,
             }
@@ -964,9 +984,8 @@ class EngineCore:
         request_groups: list[list[str]],
         access_per_request: int,
         compute_per_request: int,
-        compute_tokens: int,
+        group_sizes: list[int],
         prompt_len: int,
-        max_concurrent: int,
         num_iterations: int,
         warmup_iterations: int,
     ) -> list[float]:
@@ -975,11 +994,13 @@ class EngineCore:
 
         Uses non-blocking execute_model + sample_tokens with pipeline pattern.
         Measures steady-state throughput cadence (intervals between completions).
+        Supports uneven group sizes (e.g. [2, 1, 1, 1] for batch_size=5, PP=4).
 
         Returns:
             List of step time intervals in milliseconds.
         """
-        pipeline_fill_steps = max_concurrent - 1
+        num_groups = len(request_groups)
+        pipeline_fill_steps = num_groups - 1
         total_steps = pipeline_fill_steps + warmup_iterations + num_iterations + 1
 
         batch_queue: deque[
@@ -989,7 +1010,7 @@ class EngineCore:
 
         for step_idx in range(total_steps):
             # Select current group (rotation)
-            group_idx = step_idx % max_concurrent
+            group_idx = step_idx % num_groups
             group_request_ids = request_groups[group_idx]
 
             # Activate current group (schedule compute_per_request tokens)
@@ -998,11 +1019,12 @@ class EngineCore:
             # Schedule
             scheduler_output = self.scheduler.schedule()
 
-            # Validate scheduled tokens
+            # Validate scheduled tokens (per-group expected tokens)
+            expected_tokens = group_sizes[group_idx] * compute_per_request
             scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-            if scheduled_tokens != compute_tokens:
+            if scheduled_tokens != expected_tokens:
                 raise RuntimeError(
-                    f"Scheduler token mismatch: expected {compute_tokens}, "
+                    f"Scheduler token mismatch: expected {expected_tokens}, "
                     f"got {scheduled_tokens}. Check scheduler config."
                 )
 
@@ -1032,7 +1054,7 @@ class EngineCore:
             )
 
             # Pipeline is full, wait for oldest step to complete
-            if len(batch_queue) >= max_concurrent:
+            if len(batch_queue) >= num_groups:
                 self._wait_and_record_step(
                     batch_queue, request_groups, prompt_len,
                     completion_times, pipeline_fill_steps + warmup_iterations
@@ -1111,8 +1133,11 @@ class EngineCore:
                     model_output = self.model_executor.sample_tokens(grammar_output)
             end_time = time.perf_counter()
 
-            # Update scheduler state
-            self.scheduler.update_from_output(scheduler_output, model_output)
+            # Skip update_from_output: it adds output tokens which
+            # increment num_tokens. When prompt_len is close to
+            # max_model_len, this causes the request to be removed
+            # after a few iterations. Without it, num_tokens stays
+            # stable and deactivation works correctly.
 
             # Deactivate requests (reset for next iteration)
             self._deactivate_profile_group(request_ids)
@@ -1129,9 +1154,7 @@ class EngineCore:
         compute_tokens: int,
         access_tokens: int,
         prompt_len: int,
-        max_concurrent: int,
         compute_per_request: int,
-        per_group_batch_size: int,
         per_step_compute_tokens: int,
     ) -> None:
         """Validate parameters for profile_step."""
@@ -1162,7 +1185,7 @@ class EngineCore:
                 f"max_num_batched_tokens ({max_num_batched_tokens})"
             )
 
-        # Total requests = batch_size (distributed across max_concurrent groups)
+        # Total requests = batch_size (distributed across groups)
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
         if batch_size > max_num_seqs:
             raise ValueError(
@@ -1302,6 +1325,125 @@ class EngineCore:
                     f"got {actual_computed}. Check KV cache capacity."
                 )
 
+    def _fast_fill_kv_cache_for_group(
+        self, request_ids: list[str], target_computed_tokens: int
+    ) -> None:
+        """Allocate KV blocks without full model execution (profiling only).
+
+        Two phases:
+        1. One real execution with 1 token per request to move all
+           requests from waiting → running and initialize model runner
+           state (requests must appear in scheduled_new_reqs, which
+           only happens when they leave the waiting queue).
+        2. Schedule-only loop to allocate remaining KV blocks without
+           model execution. KV blocks contain uninitialized data, which
+           is fine for timing profiling since attention cost depends on
+           KV count, not KV values.
+
+        Temporarily enlarges scheduling limits to minimize iterations.
+        """
+        num_reqs = len(request_ids)
+        if num_reqs == 0:
+            return
+
+        # Save original scheduling limits.
+        saved_max_tokens = self.scheduler.max_num_scheduled_tokens
+        saved_max_reqs = self.scheduler.max_num_running_reqs
+        saved_threshold = (
+            self.vllm_config.scheduler_config
+            .long_prefill_token_threshold
+        )
+
+        try:
+            # --- Phase 1: One real step to initialize model runner ---
+            # Set limits so all requests move from waiting → running
+            # with 1 token each. This is cheap (num_reqs tokens total)
+            # but necessary: only WAITING→RUNNING transitions produce
+            # scheduled_new_reqs entries that the model runner uses
+            # to initialize request state.
+            self.scheduler.max_num_running_reqs = max(
+                saved_max_reqs,
+                len(self.scheduler.running) + num_reqs
+            )
+            self.scheduler.max_num_scheduled_tokens = max(
+                saved_max_tokens, num_reqs
+            )
+            # 1 token per request during this init step
+            self.vllm_config.scheduler_config \
+                .long_prefill_token_threshold = 1
+
+            scheduler_output = self.scheduler.schedule()
+            if scheduler_output.total_num_scheduled_tokens > 0:
+                grammar_output = self.scheduler.get_grammar_bitmask(
+                    scheduler_output
+                )
+                with self.log_error_detail(scheduler_output):
+                    model_output = self.model_executor.execute_model(
+                        scheduler_output, non_block=False
+                    )
+                    if model_output is None:
+                        model_output = (
+                            self.model_executor.sample_tokens(
+                                grammar_output
+                            )
+                        )
+                self.scheduler.update_from_output(
+                    scheduler_output, model_output
+                )
+
+            # --- Phase 2: Schedule-only fast fill for remaining tokens ---
+            total_needed = target_computed_tokens * num_reqs
+            self.scheduler.max_num_scheduled_tokens = max(
+                saved_max_tokens, total_needed
+            )
+            # 0 disables per-request cap (condition: 0 < threshold < n)
+            self.vllm_config.scheduler_config \
+                .long_prefill_token_threshold = 0
+
+            max_iterations = 1000
+            for _ in range(max_iterations):
+                all_filled = all(
+                    self.scheduler.requests[req_id].num_computed_tokens
+                    >= target_computed_tokens
+                    for req_id in request_ids
+                    if req_id in self.scheduler.requests
+                )
+                if all_filled:
+                    break
+
+                scheduler_output = self.scheduler.schedule()
+                if scheduler_output.total_num_scheduled_tokens == 0:
+                    break
+                # schedule() already allocated blocks and advanced
+                # num_computed_tokens via _update_after_schedule.
+                # Skip execute_model and update_from_output entirely.
+
+            # Clear prev_step tracking so the next real schedule()
+            # sends full request data (all_token_ids) in
+            # CachedRequestData, allowing the model runner to
+            # reconcile any state drift from skipped executions.
+            self.scheduler.prev_step_scheduled_req_ids.clear()
+        finally:
+            # Always restore original scheduling limits.
+            self.scheduler.max_num_scheduled_tokens = saved_max_tokens
+            self.scheduler.max_num_running_reqs = saved_max_reqs
+            self.vllm_config.scheduler_config \
+                .long_prefill_token_threshold = saved_threshold
+
+        # Hard check
+        for req_id in request_ids:
+            if req_id not in self.scheduler.requests:
+                raise RuntimeError(
+                    f"Request {req_id} not found after fast KV fill"
+                )
+            actual = self.scheduler.requests[req_id].num_computed_tokens
+            if actual < target_computed_tokens:
+                raise RuntimeError(
+                    f"Fast KV fill failed for request {req_id}: "
+                    f"expected {target_computed_tokens} computed tokens, "
+                    f"got {actual}. Check KV cache capacity."
+                )
+
     def _activate_profile_group(
         self, request_ids: list[str], compute_per_request: int
     ) -> None:
@@ -1359,14 +1501,592 @@ class EngineCore:
         with self.log_error_detail(oldest_sched_output):
             model_output = oldest_future.result()
 
-        # Update scheduler state
-        self.scheduler.update_from_output(oldest_sched_output, model_output)
+        # Skip update_from_output to prevent num_tokens growth
+        # (same rationale as _profile_step_sync)
 
         # Deactivate completed group
         group_request_ids = request_groups[group_idx]
         self._deactivate_profile_group(group_request_ids)
 
         # Record completion time (skip pipeline fill and warmup)
+        if step_idx >= record_threshold:
+            completion_times.append(time.perf_counter())
+
+    def profile_step_batch(
+        self,
+        samples: list[list[int]],
+        num_iterations: int = 20,
+        warmup_iterations: int = 5,
+    ) -> list[dict]:
+        """
+        Batch profile: group samples by B, prefill once per group,
+        then iterate over (C, A) pairs reusing the same KV cache.
+
+        Args:
+            samples: List of [B, C, A] triples.
+            num_iterations: Number of measurement iterations per sample.
+            warmup_iterations: Number of warmup iterations per sample.
+
+        Returns:
+            List of result dicts, one per sample, in the same order.
+        """
+        import random
+        import uuid
+        from collections import defaultdict
+
+        import numpy as np
+
+        from vllm.sampling_params import SamplingParams
+
+        if not self._profile_lock.acquire(blocking=False):
+            raise RuntimeError(
+                "Another profiling operation is in progress. "
+                "Please wait for it to complete."
+            )
+
+        use_batch_queue = self.batch_queue_size > 1
+        max_concurrent = (
+            self.model_executor.max_concurrent_batches if use_batch_queue else 1
+        )
+        original_threshold = (
+            self.vllm_config.scheduler_config.long_prefill_token_threshold
+        )
+
+        try:
+            if self.scheduler.has_requests():
+                raise RuntimeError(
+                    "Engine must be idle before profiling. "
+                    "Please wait for all requests to complete."
+                )
+
+            # Group samples by B: {B: [(original_idx, C, A), ...]}
+            groups: dict[int, list[tuple[int, int, int]]] = defaultdict(list)
+            for idx, sample in enumerate(samples):
+                B, C, A = sample[0], sample[1], sample[2]
+                groups[B].append((idx, C, A))
+
+            results: list[dict | None] = [None] * len(samples)
+            special_token_ids = self._get_special_token_ids()
+
+            for B in sorted(groups):
+                group_samples = groups[B]
+
+                # --- Group-level validations (B is constant within group) ---
+                max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+                if B > max_num_seqs:
+                    for orig_idx, C, A in group_samples:
+                        results[orig_idx] = {
+                            "error": (
+                                f"batch_size ({B}) exceeds "
+                                f"max_num_seqs ({max_num_seqs})"
+                            ),
+                            "batch_size": B,
+                            "compute_tokens": C,
+                            "access_tokens": A,
+                        }
+                    continue
+
+                # Distribute B requests across groups as evenly as possible
+                num_groups = min(max_concurrent, B)
+                base_size, remainder = divmod(B, num_groups)
+                group_sizes = [
+                    base_size + (1 if g < remainder else 0)
+                    for g in range(num_groups)
+                ]
+                max_group_size = max(group_sizes)
+
+                # --- Per-sample validations ---
+                max_num_batched_tokens = (
+                    self.vllm_config.scheduler_config.max_num_batched_tokens
+                )
+                for orig_idx, C, A in group_samples:
+                    if C % B != 0:
+                        results[orig_idx] = {
+                            "error": (
+                                f"compute_tokens ({C}) must be divisible "
+                                f"by batch_size ({B})"
+                            ),
+                            "batch_size": B,
+                            "compute_tokens": C,
+                            "access_tokens": A,
+                        }
+                        continue
+                    if A % B != 0:
+                        results[orig_idx] = {
+                            "error": (
+                                f"access_tokens ({A}) must be divisible "
+                                f"by batch_size ({B})"
+                            ),
+                            "batch_size": B,
+                            "compute_tokens": C,
+                            "access_tokens": A,
+                        }
+                        continue
+                    per_step_ct = max_group_size * (C // B)
+                    if per_step_ct > max_num_batched_tokens:
+                        results[orig_idx] = {
+                            "error": (
+                                f"per_step_compute_tokens ({per_step_ct}) "
+                                f"exceeds max_num_batched_tokens "
+                                f"({max_num_batched_tokens})"
+                            ),
+                            "batch_size": B,
+                            "compute_tokens": C,
+                            "access_tokens": A,
+                        }
+
+                # Filter to valid samples only
+                valid_samples = [
+                    (oi, c, a) for oi, c, a in group_samples
+                    if results[oi] is None
+                ]
+                if not valid_samples:
+                    continue
+
+                # Compute max_prompt_len from valid samples only
+                max_prompt_len = max(
+                    a // B + c // B for _, c, a in valid_samples
+                )
+
+                # === Group-level checks on valid max_prompt_len ===
+                max_model_len = self.vllm_config.model_config.max_model_len
+                if max_prompt_len > max_model_len - 1:
+                    for orig_idx, C, A in valid_samples:
+                        results[orig_idx] = {
+                            "error": (
+                                f"prompt_len ({max_prompt_len}) exceeds "
+                                f"max_model_len - 1 ({max_model_len - 1})"
+                            ),
+                            "batch_size": B,
+                            "compute_tokens": C,
+                            "access_tokens": A,
+                        }
+                    continue
+
+                # === KV cache capacity validation ===
+                total_kv_tokens = B * max_prompt_len
+                num_gpu_blocks = self.vllm_config.cache_config.num_gpu_blocks
+                block_size = self.vllm_config.cache_config.block_size
+                if num_gpu_blocks is not None and block_size is not None:
+                    total_kv_capacity = num_gpu_blocks * block_size
+                    if total_kv_tokens > total_kv_capacity:
+                        for orig_idx, C, A in valid_samples:
+                            results[orig_idx] = {
+                                "error": (
+                                    f"Total KV tokens ({total_kv_tokens} = "
+                                    f"{B} × {max_prompt_len}) exceeds "
+                                    f"KV cache capacity ({total_kv_capacity})"
+                                ),
+                                "batch_size": B,
+                                "compute_tokens": C,
+                                "access_tokens": A,
+                            }
+                        continue
+
+                # === Setup: Create requests + fill KV cache ===
+                # During KV fill, groups are filled one at a time. Within
+                # each group, sequential prefill causes early-finishing
+                # requests to generate decode output tokens while later
+                # requests are still prefilling.
+                # Safe upper bound: max_group_size * steps_per_request.
+                token_budget = (
+                    self.vllm_config.scheduler_config.max_num_batched_tokens
+                )
+                if max_prompt_len > 0 and token_budget > 0:
+                    steps_per_request = (
+                        (max_prompt_len + token_budget - 1) // token_budget
+                    )
+                    kv_fill_tokens = max_group_size * steps_per_request
+                else:
+                    kv_fill_tokens = 0
+                # Also account for measurement phase tokens
+                pipeline_fill_steps = num_groups - 1
+                total_meas_steps = (
+                    pipeline_fill_steps + warmup_iterations
+                    + num_iterations + 1
+                )
+                profiling_tokens = (
+                    (total_meas_steps + num_groups - 1) // num_groups
+                )
+                # Multiply by number of valid samples since requests are
+                # reused across all (C, A) measurements for this B
+                profiling_tokens *= len(valid_samples)
+                max_tokens_needed = (
+                    profiling_tokens + kv_fill_tokens + 100
+                )
+                request_groups: list[list[str]] = []
+                sampling_params = SamplingParams(
+                    max_tokens=max_tokens_needed,
+                    temperature=0.0,
+                    skip_reading_prefix_cache=True,
+                    ignore_eos=True,
+                )
+
+                logger.info(
+                    "profile_step_batch: B=%d, %d samples, "
+                    "max_prompt_len=%d, creating %d groups (sizes=%s)",
+                    B, len(valid_samples), max_prompt_len,
+                    num_groups, group_sizes,
+                )
+
+                try:
+                    kv_fill_start = time.time()
+                    for group_idx in range(num_groups):
+                        group_request_ids = []
+                        for i in range(group_sizes[group_idx]):
+                            request_id = (
+                                f"profile_batch_g{group_idx}"
+                                f"_{uuid.uuid4().hex[:8]}_{i}"
+                            )
+                            rng = random.Random(hash(request_id))
+                            vocab_size = (
+                                self.vllm_config.model_config.get_vocab_size()
+                            )
+                            prompt_token_ids = (
+                                self._generate_safe_random_tokens(
+                                    rng, vocab_size, max_prompt_len,
+                                    special_token_ids,
+                                )
+                            )
+                            request = Request(
+                                request_id=request_id,
+                                prompt_token_ids=prompt_token_ids,
+                                sampling_params=sampling_params,
+                                pooling_params=None,
+                                eos_token_id=None,
+                                arrival_time=time.time(),
+                                block_hasher=self.request_block_hasher,
+                            )
+                            self.scheduler.add_request(request)
+                            group_request_ids.append(request_id)
+
+                        request_groups.append(group_request_ids)
+
+                        # Fast fill: allocate KV blocks via schedule()
+                        # only, skipping execute_model(). schedule() moves
+                        # requests from waiting → running and advances
+                        # num_computed_tokens; no model execution needed.
+                        if max_prompt_len > 0:
+                            self._fast_fill_kv_cache_for_group(
+                                group_request_ids, max_prompt_len
+                            )
+
+                        # Deactivate this group
+                        self._deactivate_profile_group(group_request_ids)
+
+                    kv_fill_time_s = time.time() - kv_fill_start
+                    logger.info(
+                        "profile_step_batch: B=%d, KV cache filled in %.3fs",
+                        B, kv_fill_time_s,
+                    )
+
+                    # === Iterate over (C, A) pairs ===
+                    use_pipeline = use_batch_queue and num_groups > 1
+                    for orig_idx, C, A in valid_samples:
+                        sample_start = time.time()
+                        compute_per_req = C // B
+                        access_per_req = A // B
+
+                        self.vllm_config.scheduler_config \
+                            .long_prefill_token_threshold = compute_per_req
+
+                        try:
+                            if use_pipeline:
+                                step_times = (
+                                    self._profile_batch_measure_pipeline(
+                                        request_groups=request_groups,
+                                        access_per_request=access_per_req,
+                                        compute_per_request=compute_per_req,
+                                        group_sizes=group_sizes,
+                                        num_iterations=num_iterations,
+                                        warmup_iterations=warmup_iterations,
+                                    )
+                                )
+                            else:
+                                expected_tokens = (
+                                    group_sizes[0] * compute_per_req
+                                )
+                                step_times = (
+                                    self._profile_batch_measure_sync(
+                                        request_ids=request_groups[0],
+                                        access_per_request=access_per_req,
+                                        compute_per_request=compute_per_req,
+                                        expected_compute_tokens=expected_tokens,
+                                        num_iterations=num_iterations,
+                                        warmup_iterations=warmup_iterations,
+                                    )
+                                )
+
+                            if step_times:
+                                avg_time = float(np.mean(step_times))
+                                std_time = float(np.std(step_times))
+                                min_time = float(np.min(step_times))
+                                max_time = float(np.max(step_times))
+                            else:
+                                avg_time = std_time = min_time = max_time = 0.0
+
+                            sample_time_s = time.time() - sample_start
+                            results[orig_idx] = {
+                                "avg_step_time_ms": avg_time,
+                                "std_step_time_ms": std_time,
+                                "min_step_time_ms": min_time,
+                                "max_step_time_ms": max_time,
+                                "num_samples": len(step_times),
+                                "batch_size": B,
+                                "compute_tokens": C,
+                                "access_tokens": A,
+                                "num_iterations": num_iterations,
+                                "warmup_iterations": warmup_iterations,
+                                "max_concurrent_batches": max_concurrent,
+                                "execution_mode": (
+                                    "pipeline" if use_pipeline
+                                    else "sync"
+                                ),
+                                "pp_size": (
+                                    self.vllm_config.parallel_config
+                                    .pipeline_parallel_size
+                                ),
+                                "tp_size": (
+                                    self.vllm_config.parallel_config
+                                    .tensor_parallel_size
+                                ),
+                                "kv_fill_time_s": kv_fill_time_s,
+                                "sample_time_s": sample_time_s,
+                            }
+                        except Exception as e:
+                            logger.warning(
+                                "profile_step_batch: sample B=%d C=%d A=%d "
+                                "failed: %s", B, C, A, e,
+                            )
+                            results[orig_idx] = {
+                                "error": str(e),
+                                "batch_size": B,
+                                "compute_tokens": C,
+                                "access_tokens": A,
+                            }
+
+                finally:
+                    # Cleanup requests for this B-group
+                    for group_request_ids in request_groups:
+                        try:
+                            self.abort_requests(group_request_ids)
+                        except Exception as e:
+                            logger.warning(
+                                "Failed to cleanup profile requests: %s", e
+                            )
+
+            # Ensure no None values remain (defensive)
+            for i in range(len(results)):
+                if results[i] is None:
+                    B, C, A = samples[i][0], samples[i][1], samples[i][2]
+                    results[i] = {
+                        "error": "Sample was not processed (internal error)",
+                        "batch_size": B,
+                        "compute_tokens": C,
+                        "access_tokens": A,
+                    }
+
+            return results
+
+        finally:
+            self.vllm_config.scheduler_config.long_prefill_token_threshold = (
+                original_threshold
+            )
+            self._profile_lock.release()
+
+    def _profile_batch_measure_sync(
+        self,
+        request_ids: list[str],
+        access_per_request: int,
+        compute_per_request: int,
+        expected_compute_tokens: int,
+        num_iterations: int,
+        warmup_iterations: int,
+    ) -> list[float]:
+        """
+        Sync mode measurement for batch profiling.
+
+        Key differences from _profile_step_sync:
+        1. Sets num_computed_tokens = access_per_request (absolute value)
+        2. Does NOT call update_from_output (avoids output token growth)
+        3. Deactivates after each iteration
+        """
+        step_times: list[float] = []
+        total_iterations = warmup_iterations + num_iterations
+
+        for i in range(total_iterations):
+            # Activate: set num_computed_tokens = access_per_request
+            for req_id in request_ids:
+                if req_id in self.scheduler.requests:
+                    self.scheduler.requests[req_id].num_computed_tokens = (
+                        access_per_request
+                    )
+
+            scheduler_output = self.scheduler.schedule()
+
+            scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+            if scheduled_tokens != expected_compute_tokens:
+                raise RuntimeError(
+                    f"Scheduler token mismatch: expected "
+                    f"{expected_compute_tokens}, got {scheduled_tokens}."
+                )
+
+            # Per-request validation
+            for req_id in request_ids:
+                req_scheduled = scheduler_output.num_scheduled_tokens.get(
+                    req_id, 0
+                )
+                if req_scheduled != compute_per_request:
+                    raise RuntimeError(
+                        f"Per-request token mismatch: expected "
+                        f"{compute_per_request}, got {req_scheduled} "
+                        f"for request {req_id}."
+                    )
+
+            grammar_output = self.scheduler.get_grammar_bitmask(
+                scheduler_output
+            )
+
+            start_time = time.perf_counter()
+            with self.log_error_detail(scheduler_output):
+                model_output = self.model_executor.execute_model(
+                    scheduler_output, non_block=False
+                )
+                if model_output is None:
+                    model_output = self.model_executor.sample_tokens(
+                        grammar_output
+                    )
+            end_time = time.perf_counter()
+
+            # Do NOT call update_from_output — avoid output token growth
+            self._deactivate_profile_group(request_ids)
+
+            if i >= warmup_iterations:
+                step_times.append((end_time - start_time) * 1000)
+
+        return step_times
+
+    def _profile_batch_measure_pipeline(
+        self,
+        request_groups: list[list[str]],
+        access_per_request: int,
+        compute_per_request: int,
+        group_sizes: list[int],
+        num_iterations: int,
+        warmup_iterations: int,
+    ) -> list[float]:
+        """
+        Pipeline mode measurement for batch profiling.
+
+        Key differences from _profile_step_with_batch_queue:
+        1. Sets num_computed_tokens = access_per_request (absolute value)
+        2. Does NOT call update_from_output (avoids output token growth)
+        3. Deactivates completed groups immediately
+        Supports uneven group sizes (e.g. [2, 1, 1, 1]).
+        """
+        num_groups = len(request_groups)
+        pipeline_fill_steps = num_groups - 1
+        total_steps = pipeline_fill_steps + warmup_iterations + num_iterations + 1
+
+        batch_queue: deque[
+            tuple[Future[ModelRunnerOutput], SchedulerOutput, int, int]
+        ] = deque()
+        completion_times: list[float] = []
+        record_threshold = pipeline_fill_steps + warmup_iterations
+
+        for step_idx in range(total_steps):
+            group_idx = step_idx % num_groups
+            group_request_ids = request_groups[group_idx]
+
+            # Activate: set num_computed_tokens = access_per_request
+            for req_id in group_request_ids:
+                if req_id in self.scheduler.requests:
+                    self.scheduler.requests[req_id].num_computed_tokens = (
+                        access_per_request
+                    )
+
+            scheduler_output = self.scheduler.schedule()
+
+            # Immediately deactivate so subsequent schedule() calls
+            # don't re-schedule this group. scheduler_output already
+            # captured all decisions; execution doesn't read
+            # num_computed_tokens.
+            self._deactivate_profile_group(group_request_ids)
+
+            expected_tokens = group_sizes[group_idx] * compute_per_request
+            scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+            if scheduled_tokens != expected_tokens:
+                raise RuntimeError(
+                    f"Scheduler token mismatch: expected "
+                    f"{expected_tokens}, got {scheduled_tokens}."
+                )
+
+            # Per-request validation
+            for req_id in group_request_ids:
+                req_scheduled = scheduler_output.num_scheduled_tokens.get(
+                    req_id, 0
+                )
+                if req_scheduled != compute_per_request:
+                    raise RuntimeError(
+                        f"Per-request token mismatch: expected "
+                        f"{compute_per_request}, got {req_scheduled} "
+                        f"for request {req_id}."
+                    )
+
+            exec_future = self.model_executor.execute_model(
+                scheduler_output, non_block=True
+            )
+            exec_future.add_done_callback(
+                self._log_err_callback(scheduler_output)
+            )
+
+            grammar_output = self.scheduler.get_grammar_bitmask(
+                scheduler_output
+            )
+            sample_future = self.model_executor.sample_tokens(
+                grammar_output, non_block=True
+            )
+
+            batch_queue.appendleft(
+                (sample_future, scheduler_output, group_idx, step_idx)
+            )
+
+            if len(batch_queue) >= num_groups:
+                self._wait_and_record_batch_step(
+                    batch_queue, request_groups,
+                    completion_times, record_threshold,
+                )
+
+        while batch_queue:
+            self._wait_and_record_batch_step(
+                batch_queue, request_groups,
+                completion_times, record_threshold,
+            )
+
+        intervals_ms = [
+            (completion_times[i + 1] - completion_times[i]) * 1000
+            for i in range(len(completion_times) - 1)
+        ]
+        return intervals_ms
+
+    def _wait_and_record_batch_step(
+        self,
+        batch_queue: deque[
+            tuple[Future[ModelRunnerOutput], SchedulerOutput, int, int]
+        ],
+        request_groups: list[list[str]],
+        completion_times: list[float],
+        record_threshold: int,
+    ) -> None:
+        """Wait for oldest future to complete and record time.
+        Groups are already deactivated right after schedule()."""
+        oldest_future, oldest_sched_output, group_idx, step_idx = (
+            batch_queue.pop()
+        )
+
+        with self.log_error_detail(oldest_sched_output):
+            oldest_future.result()
+
         if step_idx >= record_threshold:
             completion_times.append(time.perf_counter())
 

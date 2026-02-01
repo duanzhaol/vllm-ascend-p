@@ -1,3 +1,4 @@
+*.joblib
 *.csv
 config*.json
 *.png

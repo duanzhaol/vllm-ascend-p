@@ -20,8 +20,10 @@ logger = logging.getLogger(__name__)
 # Try to import the C++ simulation core.
 try:
     from ._cpp import run_simulation as _cpp_run_simulation
+    from ._cpp import run_simulation_native as _cpp_run_simulation_native
     from ._cpp import SimConfig as _CppSimConfig
     from ._cpp import Request as _CppRequest
+    from ._cpp import TreeEnsembleData as _CppTreeEnsembleData
 
     _HAS_CPP = True
 except ImportError:
@@ -84,12 +86,39 @@ class SimulationEngine:
         cpp_config.max_kv_tokens = self.config.max_kv_tokens
         cpp_config.enable_chunked_prefill = self.config.enable_chunked_prefill
 
-        # Use the raw sklearn predict (C++ does its own caching)
-        def predict_fn(b: int, c: int, a: int) -> float:
-            return self.perf_model.predict(b, c, a)
+        # Try native tree ensemble (zero Python callbacks)
+        cpp_result = None
+        try:
+            tree_dict = self.perf_model.export_trees_for_cpp()
+            td = _CppTreeEnsembleData()
+            td.n_trees = tree_dict["n_trees"]
+            td.tree_offsets = tree_dict["tree_offsets"]
+            td.feature = tree_dict["feature"]
+            td.threshold = tree_dict["threshold"]
+            td.children_left = tree_dict["children_left"]
+            td.children_right = tree_dict["children_right"]
+            td.value = tree_dict["value"]
+            td.learning_rate = tree_dict["learning_rate"]
+            td.init_value = tree_dict["init_value"]
+            td.use_log_target = tree_dict["use_log_target"]
+            td.use_extended_features = tree_dict["use_extended_features"]
+            cpp_result = _cpp_run_simulation_native(
+                cpp_config, cpp_requests, td
+            )
+        except Exception:
+            logger.debug(
+                "Native tree export unavailable, falling back to callback",
+                exc_info=True,
+            )
 
-        # Run the C++ simulation
-        cpp_result = _cpp_run_simulation(cpp_config, cpp_requests, predict_fn)
+        # Fallback: Python callback
+        if cpp_result is None:
+            def predict_fn(b: int, c: int, a: int) -> float:
+                return self.perf_model.predict(b, c, a)
+
+            cpp_result = _cpp_run_simulation(
+                cpp_config, cpp_requests, predict_fn
+            )
 
         # Convert C++ results back to Python Request objects for metrics
         metrics = MetricsCollector()

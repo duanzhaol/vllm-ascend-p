@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import enum
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 
 class RequestStatus(enum.Enum):
@@ -177,3 +179,132 @@ class SimulationResult:
 
     total_steps: int = 0
     step_log: list[StepResult] | None = None
+
+
+# -----------------------------------------------------------------------
+# Cluster simulation types
+# -----------------------------------------------------------------------
+
+
+@dataclass
+class InstanceConfig:
+    """Configuration for an instance group within a cluster."""
+
+    group_id: str = ""
+    count: int = 1
+    model_name: str = "qwen"
+    pp_size: int = 4
+    tp_size: int = 1
+    max_num_batched_tokens: int = 2048
+    max_num_seqs: int = 256
+    max_kv_tokens: int = 354_704
+    enable_chunked_prefill: bool = True
+    perf_model_dir: str | None = None
+
+    def to_sim_config(self) -> SimConfig:
+        return SimConfig(
+            model_name=self.model_name,
+            pp_size=self.pp_size,
+            tp_size=self.tp_size,
+            max_num_batched_tokens=self.max_num_batched_tokens,
+            max_num_seqs=self.max_num_seqs,
+            max_kv_tokens=self.max_kv_tokens,
+            enable_chunked_prefill=self.enable_chunked_prefill,
+            perf_model_dir=self.perf_model_dir,
+        )
+
+
+@dataclass
+class ClusterConfig:
+    """Configuration for a cluster of inference instances."""
+
+    instances: list[InstanceConfig]
+    dispatch_strategy: str = "round_robin"
+
+    def __post_init__(self) -> None:
+        # Auto-generate group_id for groups that don't have one.
+        for i, inst in enumerate(self.instances):
+            if not inst.group_id:
+                inst.group_id = f"group_{i}"
+
+    @classmethod
+    def load(cls, path: str) -> ClusterConfig:
+        """Load cluster config from YAML or JSON (auto-detect by extension)."""
+        p = Path(path)
+        suffix = p.suffix.lower()
+        if suffix in (".yaml", ".yml"):
+            return cls._from_yaml(p)
+        elif suffix == ".json":
+            return cls._from_json(p)
+        else:
+            raise ValueError(
+                f"Unsupported config format: {suffix}. Use .yaml/.yml or .json"
+            )
+
+    @classmethod
+    def _from_json(cls, path: Path) -> ClusterConfig:
+        with open(path) as f:
+            data = json.load(f)
+        return cls._from_dict(data)
+
+    @classmethod
+    def _from_yaml(cls, path: Path) -> ClusterConfig:
+        try:
+            import yaml
+        except ImportError:
+            raise ImportError(
+                "PyYAML is required for YAML config files. "
+                "Install with: pip install pyyaml"
+            )
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        return cls._from_dict(data)
+
+    @classmethod
+    def _from_dict(cls, data: dict) -> ClusterConfig:
+        instances = []
+        for inst_data in data.get("instances", []):
+            inst = InstanceConfig(
+                group_id=inst_data.get("id", ""),
+                count=inst_data.get("count", 1),
+                model_name=inst_data.get("model_name", "qwen"),
+                pp_size=inst_data.get("pp_size", 4),
+                tp_size=inst_data.get("tp_size", 1),
+                max_num_batched_tokens=inst_data.get(
+                    "max_num_batched_tokens", 2048
+                ),
+                max_num_seqs=inst_data.get("max_num_seqs", 256),
+                max_kv_tokens=inst_data.get("max_kv_tokens", 354_704),
+                enable_chunked_prefill=inst_data.get(
+                    "enable_chunked_prefill", True
+                ),
+                perf_model_dir=inst_data.get("perf_model_dir"),
+            )
+            instances.append(inst)
+        return cls(
+            instances=instances,
+            dispatch_strategy=data.get("dispatch_strategy", "round_robin"),
+        )
+
+    @property
+    def total_instances(self) -> int:
+        return sum(inst.count for inst in self.instances)
+
+
+@dataclass
+class InstanceResult:
+    """Simulation result for a single instance."""
+
+    instance_idx: int
+    group_id: str
+    result: SimulationResult
+
+
+@dataclass
+class ClusterResult:
+    """Aggregate results for a cluster simulation."""
+
+    aggregate: SimulationResult
+    per_instance: list[InstanceResult]
+    dispatch_counts: list[int]
+    total_instances: int

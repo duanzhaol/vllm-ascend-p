@@ -6,9 +6,12 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
+#include <queue>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -95,19 +98,59 @@ struct StepPlan {
 };
 
 // -----------------------------------------------------------------------
-// Performance predictor (Python callback + C++ cache)
+// Tree ensemble for native perf_model prediction (no Python callback)
+// -----------------------------------------------------------------------
+struct TreeEnsembleData {
+    int n_trees = 0;
+    std::vector<int> tree_offsets;      // [n_trees+1] node offsets
+    std::vector<int> feature;           // split feature (-2 = leaf)
+    std::vector<double> threshold;
+    std::vector<int> children_left;     // left child (tree-local index)
+    std::vector<int> children_right;
+    std::vector<double> value;          // leaf/node value
+    double learning_rate = 0.0;
+    double init_value = 0.0;
+    bool use_log_target = true;
+    bool use_extended_features = true;
+};
+
+class TreeEnsemble {
+public:
+    explicit TreeEnsemble(TreeEnsembleData data) : d_(std::move(data)) {}
+
+    // Predict step_time_ms from raw (B, C, A).
+    double predict(int B, int C, int A) const;
+
+private:
+    TreeEnsembleData d_;
+    double traverse_tree(int tree_idx, const double* features) const;
+};
+
+// -----------------------------------------------------------------------
+// Performance predictor (two modes: Python callback OR native tree)
 // -----------------------------------------------------------------------
 using PredictFn = std::function<double(int, int, int)>;
 
 class PerfPredictor {
 public:
+    // Mode 1: Python callback (legacy)
     explicit PerfPredictor(PredictFn fn) : py_predict_(std::move(fn)) {}
+
+    // Mode 2: Native tree ensemble (zero Python calls)
+    explicit PerfPredictor(TreeEnsembleData data)
+        : ensemble_(std::make_unique<TreeEnsemble>(std::move(data))) {}
 
     double predict(int B, int C, int A);
 
 private:
     PredictFn py_predict_;
+    std::unique_ptr<TreeEnsemble> ensemble_;
     std::unordered_map<uint64_t, double> cache_;
+
+    double raw_predict(int qB, int qC, int qA) {
+        if (ensemble_) return ensemble_->predict(qB, qC, qA);
+        return py_predict_(qB, qC, qA);
+    }
 
     static uint64_t pack_key(int b, int c, int a) {
         return (static_cast<uint64_t>(static_cast<uint16_t>(b)) << 48) |
@@ -175,11 +218,101 @@ struct SimResult {
 };
 
 // -----------------------------------------------------------------------
-// Main entry point
+// Main entry points (single-instance)
 // -----------------------------------------------------------------------
+
+// Python callback mode (legacy)
 SimResult run_simulation(
     const SimConfig& config,
     std::vector<Request> requests,
     PredictFn predict_fn);
+
+// Native tree ensemble mode (zero Python calls)
+SimResult run_simulation_native(
+    const SimConfig& config,
+    std::vector<Request> requests,
+    TreeEnsembleData tree_data);
+
+// -----------------------------------------------------------------------
+// Cluster simulation types
+// -----------------------------------------------------------------------
+
+enum class DispatchStrategy : uint8_t {
+    ROUND_ROBIN,
+    LEAST_LOADED,
+};
+
+struct InstanceGroupConfig {
+    SimConfig sim_config;
+    int count = 1;
+    int predictor_idx = 0;  // index into PerfPredictor vector
+};
+
+struct ClusterConfig {
+    std::vector<InstanceGroupConfig> groups;
+    DispatchStrategy dispatch_strategy = DispatchStrategy::ROUND_ROBIN;
+};
+
+// Per-instance runtime state during cluster simulation.
+struct InstanceState {
+    int instance_idx;
+    int group_idx;
+    Scheduler scheduler;
+    double clock = 0.0;
+    std::deque<int> pending;  // pool indices dispatched but not yet injected
+    bool step_scheduled = false;
+    int total_steps = 0;
+
+    InstanceState(int idx, int gidx, const SimConfig& cfg)
+        : instance_idx(idx), group_idx(gidx), scheduler(cfg) {}
+
+    // Move constructor needed because Scheduler has non-trivial members.
+    InstanceState(InstanceState&& o) noexcept = default;
+    InstanceState& operator=(InstanceState&& o) noexcept = default;
+    InstanceState(const InstanceState&) = delete;
+    InstanceState& operator=(const InstanceState&) = delete;
+};
+
+// Event for the global event queue (min-heap).
+// Tie-breaking: REQUEST_ARRIVAL (0) before STEP_COMPLETE (1) at same time.
+struct Event {
+    double time;
+    enum Type : uint8_t { REQUEST_ARRIVAL = 0, STEP_COMPLETE = 1 } type;
+    int data;  // REQUEST_ARRIVAL: pool index, STEP_COMPLETE: instance index
+
+    bool operator>(const Event& o) const {
+        if (time != o.time) return time > o.time;
+        return type > o.type;
+    }
+};
+
+// Per-instance result for cluster simulation.
+struct InstanceSimResult {
+    int instance_idx = 0;
+    int group_idx = 0;
+    std::vector<RequestResult> finished;
+    int total_steps = 0;
+};
+
+// Cluster simulation result.
+struct ClusterSimResult {
+    std::vector<InstanceSimResult> instance_results;
+    std::vector<RequestResult> all_finished;
+    int total_instances = 0;
+};
+
+// -----------------------------------------------------------------------
+// Cluster entry points
+// -----------------------------------------------------------------------
+
+ClusterSimResult run_cluster_simulation_native(
+    const ClusterConfig& config,
+    std::vector<Request> requests,
+    std::vector<TreeEnsembleData> tree_data_per_group);
+
+ClusterSimResult run_cluster_simulation(
+    const ClusterConfig& config,
+    std::vector<Request> requests,
+    std::vector<PredictFn> predict_fns_per_group);
 
 }  // namespace sim

@@ -8,8 +8,59 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 
 namespace sim {
+
+// -----------------------------------------------------------------------
+// TreeEnsemble
+// -----------------------------------------------------------------------
+
+double TreeEnsemble::predict(int B, int C, int A) const {
+    double features[9];
+    double bf = static_cast<double>(B);
+    double cf = static_cast<double>(C);
+    double af = static_cast<double>(A);
+
+    if (d_.use_extended_features) {
+        double safe_b = std::max(1.0, bf);
+        features[0] = bf;                         // batch_size
+        features[1] = cf;                         // compute_tokens
+        features[2] = af;                         // access_tokens
+        features[3] = cf / safe_b;                // per_req_compute
+        features[4] = af / safe_b;                // per_req_access
+        features[5] = (B == 1) ? 1.0 : 0.0;      // is_sync
+        features[6] = std::log1p(bf);             // log1p_batch_size
+        features[7] = std::log1p(cf);             // log1p_compute_tokens
+        features[8] = std::log1p(af);             // log1p_access_tokens
+    } else {
+        features[0] = bf;
+        features[1] = cf;
+        features[2] = af;
+    }
+
+    double sum = d_.init_value;
+    for (int t = 0; t < d_.n_trees; ++t) {
+        sum += d_.learning_rate * traverse_tree(t, features);
+    }
+
+    if (d_.use_log_target) return std::exp(sum);
+    return std::max(0.0, sum);
+}
+
+double TreeEnsemble::traverse_tree(int tree_idx,
+                                   const double* features) const {
+    int base = d_.tree_offsets[tree_idx];
+    int node = 0;  // root is always node 0 within each tree
+    // sklearn: feature == -2 (TREE_UNDEFINED) indicates a leaf node
+    while (d_.feature[base + node] != -2) {
+        if (features[d_.feature[base + node]] <= d_.threshold[base + node])
+            node = d_.children_left[base + node];
+        else
+            node = d_.children_right[base + node];
+    }
+    return d_.value[base + node];
+}
 
 // -----------------------------------------------------------------------
 // PerfPredictor
@@ -26,7 +77,7 @@ double PerfPredictor::predict(int B, int C, int A) {
     if (it != cache_.end()) {
         return it->second;
     }
-    double val = py_predict_(qB, qC, qA);
+    double val = raw_predict(qB, qC, qA);
     cache_[key] = val;
     return val;
 }
@@ -235,13 +286,13 @@ void Scheduler::advance_after_step(
 }
 
 // -----------------------------------------------------------------------
-// Engine: main simulation loop
+// Engine: main simulation loop (shared implementation)
 // -----------------------------------------------------------------------
 
-SimResult run_simulation(
+static SimResult run_simulation_impl(
         const SimConfig& config,
         std::vector<Request> pool,
-        PredictFn predict_fn) {
+        PerfPredictor& predictor) {
 
     int total = static_cast<int>(pool.size());
 
@@ -264,7 +315,6 @@ SimResult run_simulation(
     }
 
     Scheduler scheduler(config);
-    PerfPredictor predictor(std::move(predict_fn));
 
     double clock = 0.0;
     int step_index = 0;
@@ -347,6 +397,285 @@ SimResult run_simulation(
     }
 
     return result;
+}
+
+// -----------------------------------------------------------------------
+// Public API: Python callback mode
+// -----------------------------------------------------------------------
+
+SimResult run_simulation(
+        const SimConfig& config,
+        std::vector<Request> pool,
+        PredictFn predict_fn) {
+    PerfPredictor predictor(std::move(predict_fn));
+    return run_simulation_impl(config, std::move(pool), predictor);
+}
+
+// -----------------------------------------------------------------------
+// Public API: Native tree ensemble mode
+// -----------------------------------------------------------------------
+
+SimResult run_simulation_native(
+        const SimConfig& config,
+        std::vector<Request> pool,
+        TreeEnsembleData tree_data) {
+    PerfPredictor predictor(std::move(tree_data));
+    return run_simulation_impl(config, std::move(pool), predictor);
+}
+
+// -----------------------------------------------------------------------
+// Cluster simulation
+// -----------------------------------------------------------------------
+
+using EventQueue = std::priority_queue<Event, std::vector<Event>,
+                                       std::greater<Event>>;
+
+// Dispatch: choose target instance for a new request.
+static int cluster_dispatch(DispatchStrategy strategy,
+                            const std::vector<std::unique_ptr<InstanceState>>& instances,
+                            int& rr_counter) {
+    int n = static_cast<int>(instances.size());
+    switch (strategy) {
+        case DispatchStrategy::ROUND_ROBIN:
+            return (rr_counter++) % n;
+
+        case DispatchStrategy::LEAST_LOADED: {
+            int best = 0;
+            int best_load = std::numeric_limits<int>::max();
+            for (int i = 0; i < n; ++i) {
+                auto& inst = *instances[i];
+                int load = inst.scheduler.num_running()
+                         + inst.scheduler.num_waiting()
+                         + static_cast<int>(inst.pending.size());
+                if (load < best_load) {
+                    best_load = load;
+                    best = i;
+                }
+            }
+            return best;
+        }
+    }
+    return 0;  // fallback
+}
+
+// Try to start a step on the given instance.
+// May push a STEP_COMPLETE event into the event queue.
+// Reusable plan and finished_out are passed to avoid allocation.
+static void cluster_try_start_step(
+        InstanceState& inst,
+        std::vector<Request>& pool,
+        std::vector<PerfPredictor>& predictors,
+        EventQueue& events,
+        StepPlan& plan,
+        std::vector<int>& finished_out) {
+
+    // Inject pending requests whose arrival_time <= inst.clock.
+    while (!inst.pending.empty()) {
+        int pidx = inst.pending.front();
+        if (pool[pidx].arrival_time > inst.clock) break;
+        inst.scheduler.add_request(pidx);
+        inst.pending.pop_front();
+    }
+
+    // Schedule.
+    bool ok = inst.scheduler.schedule(plan, pool);
+
+    if (!ok) {
+        if (inst.scheduler.has_work()) {
+            inst.scheduler.abort_all();
+        }
+        if (!inst.pending.empty()) {
+            // Fast-forward clock to next pending request arrival.
+            inst.clock = pool[inst.pending.front()].arrival_time;
+            // Retry (recursive, bounded by pending queue size).
+            cluster_try_start_step(inst, pool, predictors, events,
+                                   plan, finished_out);
+        }
+        return;  // Instance goes idle.
+    }
+
+    // Predict step time.
+    PerfPredictor& predictor = predictors[inst.group_idx];
+    double step_time_ms = predictor.predict(
+        plan.batch_size, plan.compute_tokens, plan.access_tokens);
+    double step_end = inst.clock + step_time_ms / 1000.0;
+
+    // Detect first-token events.
+    if (!plan.is_decode_only) {
+        for (const auto& se : plan.scheduled) {
+            Request& req = pool[se.pool_idx];
+            if (req.first_token_time < 0.0 &&
+                req.num_computed_tokens + se.num_new_tokens
+                    >= req.prompt_tokens) {
+                req.first_token_time = step_end;
+            }
+        }
+    }
+
+    // Advance state.
+    inst.scheduler.advance_after_step(plan, step_end, pool, finished_out);
+
+    // Advance clock.
+    inst.clock = step_end;
+    inst.total_steps++;
+
+    // Push STEP_COMPLETE event.
+    Event ev;
+    ev.time = step_end;
+    ev.type = Event::STEP_COMPLETE;
+    ev.data = inst.instance_idx;
+    events.push(ev);
+    inst.step_scheduled = true;
+}
+
+static ClusterSimResult run_cluster_impl(
+        const ClusterConfig& config,
+        std::vector<Request> pool,
+        std::vector<PerfPredictor>& predictors) {
+
+    int total = static_cast<int>(pool.size());
+
+    // Precompute num_total_tokens and reset state.
+    for (auto& r : pool) {
+        r.num_total_tokens = r.prompt_tokens + std::max(r.output_tokens - 1, 0);
+        r.status = RequestStatus::WAITING;
+        r.num_computed_tokens = 0;
+        r.first_token_time = -1.0;
+        r.finish_time = -1.0;
+        r.preemption_count = 0;
+    }
+
+    // Sort by arrival time.
+    std::vector<int> arrival_order(total);
+    for (int i = 0; i < total; ++i) arrival_order[i] = i;
+    std::stable_sort(arrival_order.begin(), arrival_order.end(),
+                     [&pool](int a, int b) {
+                         return pool[a].arrival_time < pool[b].arrival_time;
+                     });
+
+    // Expand instance groups into flat instance list.
+    std::vector<std::unique_ptr<InstanceState>> instances;
+    for (int g = 0; g < static_cast<int>(config.groups.size()); ++g) {
+        for (int i = 0; i < config.groups[g].count; ++i) {
+            instances.push_back(std::make_unique<InstanceState>(
+                static_cast<int>(instances.size()), g,
+                config.groups[g].sim_config));
+        }
+    }
+    int n_instances = static_cast<int>(instances.size());
+
+    // Build event queue with all request arrivals.
+    EventQueue events;
+    for (int pidx : arrival_order) {
+        Event ev;
+        ev.time = pool[pidx].arrival_time;
+        ev.type = Event::REQUEST_ARRIVAL;
+        ev.data = pidx;
+        events.push(ev);
+    }
+
+    // Dispatch state.
+    int rr_counter = 0;
+
+    // Reusable buffers (avoid per-step allocation).
+    StepPlan plan;
+    std::vector<int> finished_out;
+    plan.scheduled.reserve(256);
+    finished_out.reserve(64);
+
+    // Track which instance each request is assigned to.
+    std::vector<int> request_instance(total, -1);
+
+    // Main event loop.
+    while (!events.empty()) {
+        Event ev = events.top();
+        events.pop();
+
+        if (ev.type == Event::REQUEST_ARRIVAL) {
+            int pool_idx = ev.data;
+            int target = cluster_dispatch(config.dispatch_strategy,
+                                          instances, rr_counter);
+            instances[target]->pending.push_back(pool_idx);
+            request_instance[pool_idx] = target;
+
+            if (!instances[target]->step_scheduled) {
+                cluster_try_start_step(*instances[target], pool, predictors,
+                                       events, plan, finished_out);
+            }
+        } else {
+            // STEP_COMPLETE
+            auto& inst = *instances[ev.data];
+            inst.step_scheduled = false;
+            cluster_try_start_step(inst, pool, predictors,
+                                   events, plan, finished_out);
+        }
+    }
+
+    // Collect results per instance.
+    ClusterSimResult result;
+    result.total_instances = n_instances;
+    result.instance_results.resize(n_instances);
+    for (int i = 0; i < n_instances; ++i) {
+        result.instance_results[i].instance_idx = i;
+        result.instance_results[i].group_idx = instances[i]->group_idx;
+        result.instance_results[i].total_steps = instances[i]->total_steps;
+    }
+
+    result.all_finished.reserve(total);
+    for (int pidx = 0; pidx < total; ++pidx) {
+        const auto& req = pool[pidx];
+        if (req.status == RequestStatus::FINISHED && req.finish_time >= 0.0) {
+            RequestResult rr;
+            rr.request_id = req.request_id;
+            rr.arrival_time = req.arrival_time;
+            rr.first_token_time = req.first_token_time;
+            rr.finish_time = req.finish_time;
+            rr.prompt_tokens = req.prompt_tokens;
+            rr.output_tokens = req.output_tokens;
+            rr.preemption_count = req.preemption_count;
+
+            int inst_idx = request_instance[pidx];
+            if (inst_idx >= 0) {
+                result.instance_results[inst_idx].finished.push_back(rr);
+            }
+            result.all_finished.push_back(std::move(rr));
+        }
+    }
+
+    return result;
+}
+
+// -----------------------------------------------------------------------
+// Public API: Cluster simulation with native tree ensemble
+// -----------------------------------------------------------------------
+
+ClusterSimResult run_cluster_simulation_native(
+        const ClusterConfig& config,
+        std::vector<Request> pool,
+        std::vector<TreeEnsembleData> tree_data_per_group) {
+
+    // Build one PerfPredictor per group.
+    std::vector<PerfPredictor> predictors;
+    for (auto& td : tree_data_per_group) {
+        predictors.emplace_back(std::move(td));
+    }
+    return run_cluster_impl(config, std::move(pool), predictors);
+}
+
+// -----------------------------------------------------------------------
+// Public API: Cluster simulation with Python callbacks
+// -----------------------------------------------------------------------
+
+ClusterSimResult run_cluster_simulation(
+        const ClusterConfig& config,
+        std::vector<Request> pool,
+        std::vector<PredictFn> predict_fns_per_group) {
+
+    std::vector<PerfPredictor> predictors;
+    for (auto& fn : predict_fns_per_group) {
+        predictors.emplace_back(std::move(fn));
+    }
+    return run_cluster_impl(config, std::move(pool), predictors);
 }
 
 }  // namespace sim

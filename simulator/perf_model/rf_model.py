@@ -369,6 +369,71 @@ class StepPerfModel:
         )
 
     # ------------------------------------------------------------------
+    # C++ export
+    # ------------------------------------------------------------------
+
+    def export_trees_for_cpp(self) -> dict:
+        """Export tree structure as flat arrays for C++ native prediction.
+
+        Works with both GradientBoostingRegressor and RandomForestRegressor.
+        The unified formula is: y = init_value + learning_rate * sum(tree_i(X))
+
+        Returns:
+            Dict with keys: n_trees, tree_offsets, feature, threshold,
+            children_left, children_right, value, learning_rate, init_value,
+            use_log_target, use_extended_features.
+        """
+        model = self._model
+
+        if isinstance(model, GradientBoostingRegressor):
+            estimators = [model.estimators_[i, 0]
+                          for i in range(model.n_estimators)]
+            learning_rate = model.learning_rate
+            init_value = float(np.asarray(model.init_.constant_).ravel()[0])
+        elif isinstance(model, RandomForestRegressor):
+            estimators = model.estimators_
+            learning_rate = 1.0 / len(estimators)
+            init_value = 0.0
+        else:
+            raise TypeError(
+                f"Unsupported model type for C++ export: {type(model)}"
+            )
+
+        # Flatten all trees into contiguous arrays.
+        tree_offsets = [0]
+        all_feature: list[int] = []
+        all_threshold: list[float] = []
+        all_left: list[int] = []
+        all_right: list[int] = []
+        all_value: list[float] = []
+
+        for est in estimators:
+            tree = est.tree_
+            n = tree.node_count
+            all_feature.extend(tree.feature.tolist())
+            all_threshold.extend(tree.threshold.tolist())
+            all_left.extend(tree.children_left.tolist())
+            all_right.extend(tree.children_right.tolist())
+            all_value.extend(tree.value[:, 0, 0].tolist())
+            tree_offsets.append(tree_offsets[-1] + n)
+
+        return {
+            "n_trees": len(estimators),
+            "tree_offsets": tree_offsets,
+            "feature": all_feature,
+            "threshold": all_threshold,
+            "children_left": all_left,
+            "children_right": all_right,
+            "value": all_value,
+            "learning_rate": learning_rate,
+            "init_value": init_value,
+            "use_log_target": self.feature_config.use_log_target,
+            "use_extended_features": (
+                self.feature_config.feature_set == FeatureSet.EXTENDED
+            ),
+        }
+
+    # ------------------------------------------------------------------
     # Inspection
     # ------------------------------------------------------------------
 

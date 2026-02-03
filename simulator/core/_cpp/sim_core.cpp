@@ -469,63 +469,64 @@ static void cluster_try_start_step(
         StepPlan& plan,
         std::vector<int>& finished_out) {
 
-    // Inject pending requests whose arrival_time <= inst.clock.
-    while (!inst.pending.empty()) {
-        int pidx = inst.pending.front();
-        if (pool[pidx].arrival_time > inst.clock) break;
-        inst.scheduler.add_request(pidx);
-        inst.pending.pop_front();
-    }
-
-    // Schedule.
-    bool ok = inst.scheduler.schedule(plan, pool);
-
-    if (!ok) {
-        if (inst.scheduler.has_work()) {
-            inst.scheduler.abort_all();
+    for (;;) {
+        // Inject pending requests whose arrival_time <= inst.clock.
+        while (!inst.pending.empty()) {
+            int pidx = inst.pending.front();
+            if (pool[pidx].arrival_time > inst.clock) break;
+            inst.scheduler.add_request(pidx);
+            inst.pending.pop_front();
         }
-        if (!inst.pending.empty()) {
-            // Fast-forward clock to next pending request arrival.
-            inst.clock = pool[inst.pending.front()].arrival_time;
-            // Retry (recursive, bounded by pending queue size).
-            cluster_try_start_step(inst, pool, predictors, events,
-                                   plan, finished_out);
+
+        // Schedule.
+        bool ok = inst.scheduler.schedule(plan, pool);
+
+        if (!ok) {
+            if (inst.scheduler.has_work()) {
+                inst.scheduler.abort_all();
+            }
+            if (!inst.pending.empty()) {
+                // Fast-forward clock to next pending request arrival.
+                inst.clock = pool[inst.pending.front()].arrival_time;
+                continue;  // Retry (loop instead of recursion).
+            }
+            return;  // Instance goes idle.
         }
-        return;  // Instance goes idle.
-    }
 
-    // Predict step time.
-    PerfPredictor& predictor = predictors[inst.group_idx];
-    double step_time_ms = predictor.predict(
-        plan.batch_size, plan.compute_tokens, plan.access_tokens);
-    double step_end = inst.clock + step_time_ms / 1000.0;
+        // Predict step time.
+        PerfPredictor& predictor = predictors[inst.group_idx];
+        double step_time_ms = predictor.predict(
+            plan.batch_size, plan.compute_tokens, plan.access_tokens);
+        double step_end = inst.clock + step_time_ms / 1000.0;
 
-    // Detect first-token events.
-    if (!plan.is_decode_only) {
-        for (const auto& se : plan.scheduled) {
-            Request& req = pool[se.pool_idx];
-            if (req.first_token_time < 0.0 &&
-                req.num_computed_tokens + se.num_new_tokens
-                    >= req.prompt_tokens) {
-                req.first_token_time = step_end;
+        // Detect first-token events.
+        if (!plan.is_decode_only) {
+            for (const auto& se : plan.scheduled) {
+                Request& req = pool[se.pool_idx];
+                if (req.first_token_time < 0.0 &&
+                    req.num_computed_tokens + se.num_new_tokens
+                        >= req.prompt_tokens) {
+                    req.first_token_time = step_end;
+                }
             }
         }
+
+        // Advance state.
+        inst.scheduler.advance_after_step(plan, step_end, pool, finished_out);
+
+        // Advance clock.
+        inst.clock = step_end;
+        inst.total_steps++;
+
+        // Push STEP_COMPLETE event.
+        Event ev;
+        ev.time = step_end;
+        ev.type = Event::STEP_COMPLETE;
+        ev.data = inst.instance_idx;
+        events.push(ev);
+        inst.step_scheduled = true;
+        break;  // Step started; exit the loop.
     }
-
-    // Advance state.
-    inst.scheduler.advance_after_step(plan, step_end, pool, finished_out);
-
-    // Advance clock.
-    inst.clock = step_end;
-    inst.total_steps++;
-
-    // Push STEP_COMPLETE event.
-    Event ev;
-    ev.time = step_end;
-    ev.type = Event::STEP_COMPLETE;
-    ev.data = inst.instance_idx;
-    events.push(ev);
-    inst.step_scheduled = true;
 }
 
 static ClusterSimResult run_cluster_impl(
@@ -586,20 +587,55 @@ static ClusterSimResult run_cluster_impl(
     // Track which instance each request is assigned to.
     std::vector<int> request_instance(total, -1);
 
+    // Per-instance dispatch counts (number of requests dispatched).
+    std::vector<int> dispatch_counts(n_instances, 0);
+
+    // Temporary buffers for batching same-timestamp arrivals.
+    std::vector<int> arrival_batch;
+    std::vector<int> affected;
+    arrival_batch.reserve(64);
+    affected.reserve(n_instances);
+
     // Main event loop.
     while (!events.empty()) {
         Event ev = events.top();
         events.pop();
 
         if (ev.type == Event::REQUEST_ARRIVAL) {
-            int pool_idx = ev.data;
-            int target = cluster_dispatch(config.dispatch_strategy,
-                                          instances, rr_counter);
-            instances[target]->pending.push_back(pool_idx);
-            request_instance[pool_idx] = target;
+            // Collect all ARRIVAL events at the same timestamp.
+            arrival_batch.clear();
+            arrival_batch.push_back(ev.data);
+            while (!events.empty()
+                   && events.top().time == ev.time
+                   && events.top().type == Event::REQUEST_ARRIVAL) {
+                arrival_batch.push_back(events.top().data);
+                events.pop();
+            }
+            // Sort by pool_idx for deterministic dispatch order.
+            std::sort(arrival_batch.begin(), arrival_batch.end());
 
-            if (!instances[target]->step_scheduled) {
-                cluster_try_start_step(*instances[target], pool, predictors,
+            // Dispatch all same-timestamp arrivals before starting steps.
+            affected.clear();
+            for (int pool_idx : arrival_batch) {
+                int target = cluster_dispatch(config.dispatch_strategy,
+                                              instances, rr_counter);
+                instances[target]->pending.push_back(pool_idx);
+                request_instance[pool_idx] = target;
+                dispatch_counts[target]++;
+
+                if (!instances[target]->step_scheduled) {
+                    // Add to affected set (check for duplicates).
+                    if (std::find(affected.begin(), affected.end(), target)
+                            == affected.end()) {
+                        affected.push_back(target);
+                    }
+                }
+            }
+
+            // Trigger steps on affected idle instances (sorted for determinism).
+            std::sort(affected.begin(), affected.end());
+            for (int idx : affected) {
+                cluster_try_start_step(*instances[idx], pool, predictors,
                                        events, plan, finished_out);
             }
         } else {
@@ -614,6 +650,7 @@ static ClusterSimResult run_cluster_impl(
     // Collect results per instance.
     ClusterSimResult result;
     result.total_instances = n_instances;
+    result.dispatch_counts = std::move(dispatch_counts);
     result.instance_results.resize(n_instances);
     for (int i = 0; i < n_instances; ++i) {
         result.instance_results[i].instance_idx = i;

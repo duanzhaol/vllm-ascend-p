@@ -135,26 +135,43 @@ class ClusterEngine:
             time, evt_type, data = heapq.heappop(events)
 
             if evt_type == _EVT_REQUEST_ARRIVAL:
-                req = req_by_idx[data]
-                # Build instance views for the dispatcher.
-                views = [
-                    InstanceView(
-                        instance_idx=inst.instance_idx,
-                        group_id=inst.group_id,
-                        num_running=len(inst.scheduler.running),
-                        num_waiting=len(inst.scheduler.waiting),
-                        num_pending=len(inst.pending),
-                        kv_used=inst.scheduler.kv_used,
-                        kv_capacity=inst.scheduler.config.max_kv_tokens,
-                    )
-                    for inst in instances
-                ]
-                target_idx = dispatcher.choose(req, views)
-                instances[target_idx].pending.append(req)
-                dispatch_counts[target_idx] += 1
+                # Collect all ARRIVAL events at the same timestamp.
+                batch = [data]
+                while (
+                    events
+                    and events[0][0] == time
+                    and events[0][1] == _EVT_REQUEST_ARRIVAL
+                ):
+                    _, _, d = heapq.heappop(events)
+                    batch.append(d)
+                # Sort by request index for deterministic dispatch order.
+                batch.sort()
 
-                if not instances[target_idx].step_scheduled:
-                    self._try_start_step(instances[target_idx], events)
+                # Dispatch all same-timestamp arrivals before starting steps.
+                affected: set[int] = set()
+                for req_idx in batch:
+                    req = req_by_idx[req_idx]
+                    views = [
+                        InstanceView(
+                            instance_idx=inst.instance_idx,
+                            group_id=inst.group_id,
+                            num_running=len(inst.scheduler.running),
+                            num_waiting=len(inst.scheduler.waiting),
+                            num_pending=len(inst.pending),
+                            kv_used=inst.scheduler.kv_used,
+                            kv_capacity=inst.scheduler.config.max_kv_tokens,
+                        )
+                        for inst in instances
+                    ]
+                    target_idx = dispatcher.choose(req, views)
+                    instances[target_idx].pending.append(req)
+                    dispatch_counts[target_idx] += 1
+                    if not instances[target_idx].step_scheduled:
+                        affected.add(target_idx)
+
+                # Now trigger steps on affected idle instances.
+                for idx in sorted(affected):
+                    self._try_start_step(instances[idx], events)
 
             else:  # STEP_COMPLETE
                 inst = instances[data]
@@ -170,66 +187,68 @@ class ClusterEngine:
         events: list[tuple[float, int, int]],
     ) -> None:
         """Try to schedule and execute one step on an instance."""
-        # Inject pending requests that have arrived.
-        while inst.pending and inst.pending[0].arrival_time <= inst.clock:
-            inst.scheduler.add_request(inst.pending.popleft())
+        while True:
+            # Inject pending requests that have arrived.
+            while inst.pending and inst.pending[0].arrival_time <= inst.clock:
+                inst.scheduler.add_request(inst.pending.popleft())
 
-        # Schedule.
-        plan = inst.scheduler.schedule()
+            # Schedule.
+            plan = inst.scheduler.schedule()
 
-        if plan is None:
-            if inst.scheduler.has_work():
-                n_run = len(inst.scheduler.running)
-                n_wait = len(inst.scheduler.waiting)
-                logger.warning(
-                    "Instance %d: scheduler stall (%d running + %d waiting). "
-                    "Aborting stuck requests.",
-                    inst.instance_idx, n_run, n_wait,
-                )
-                inst.scheduler.abort_all()
+            if plan is None:
+                if inst.scheduler.has_work():
+                    n_run = len(inst.scheduler.running)
+                    n_wait = len(inst.scheduler.waiting)
+                    logger.warning(
+                        "Instance %d: scheduler stall (%d running + %d waiting). "
+                        "Aborting stuck requests.",
+                        inst.instance_idx, n_run, n_wait,
+                    )
+                    inst.scheduler.abort_all()
 
-            if inst.pending:
-                # Fast-forward to next pending request arrival.
-                inst.clock = inst.pending[0].arrival_time
-                self._try_start_step(inst, events)
-            return  # Instance goes idle.
+                if inst.pending:
+                    # Fast-forward to next pending request arrival.
+                    inst.clock = inst.pending[0].arrival_time
+                    continue  # Retry instead of recursion.
+                return  # Instance goes idle.
 
-        # Predict step time.
-        B = plan.batch_size
-        C = plan.compute_tokens
-        A = plan.access_tokens
-        step_time_ms = inst.perf_model.predict_cached(B, C, A)
-        step_end = inst.clock + step_time_ms / 1000.0
+            # Predict step time.
+            B = plan.batch_size
+            C = plan.compute_tokens
+            A = plan.access_tokens
+            step_time_ms = inst.perf_model.predict_cached(B, C, A)
+            step_end = inst.clock + step_time_ms / 1000.0
 
-        # Detect first-token events.
-        for sr in plan.scheduled:
-            req = sr.request
-            if (
-                req.first_token_time is None
-                and req.num_computed_tokens + sr.num_new_tokens
-                >= req.prompt_tokens
-            ):
-                req.first_token_time = step_end
+            # Detect first-token events.
+            for sr in plan.scheduled:
+                req = sr.request
+                if (
+                    req.first_token_time is None
+                    and req.num_computed_tokens + sr.num_new_tokens
+                    >= req.prompt_tokens
+                ):
+                    req.first_token_time = step_end
 
-        # Advance state.
-        finished_ids = inst.scheduler.advance_after_step(plan)
+            # Advance state.
+            finished_ids = inst.scheduler.advance_after_step(plan)
 
-        # Record finish times.
-        finished_set = set(finished_ids)
-        for sr in plan.scheduled:
-            if sr.request.request_id in finished_set:
-                sr.request.finish_time = step_end
-                inst.metrics.record_finished(sr.request)
+            # Record finish times.
+            finished_set = set(finished_ids)
+            for sr in plan.scheduled:
+                if sr.request.request_id in finished_set:
+                    sr.request.finish_time = step_end
+                    inst.metrics.record_finished(sr.request)
 
-        # Advance clock.
-        inst.clock = step_end
-        inst.total_steps += 1
+            # Advance clock.
+            inst.clock = step_end
+            inst.total_steps += 1
 
-        # Push STEP_COMPLETE event.
-        heapq.heappush(
-            events, (step_end, _EVT_STEP_COMPLETE, inst.instance_idx)
-        )
-        inst.step_scheduled = True
+            # Push STEP_COMPLETE event.
+            heapq.heappush(
+                events, (step_end, _EVT_STEP_COMPLETE, inst.instance_idx)
+            )
+            inst.step_scheduled = True
+            break  # Step started; exit the while-True loop.
 
     def _collect_results(
         self,
@@ -407,7 +426,7 @@ class ClusterEngine:
 
         per_instance: list[InstanceResult] = []
         all_metrics = MetricsCollector()
-        dispatch_counts = []
+        dispatch_counts = list(cpp_result.dispatch_counts)
 
         for inst_res in cpp_result.instance_results:
             inst_metrics = MetricsCollector()
@@ -423,8 +442,6 @@ class ClusterEngine:
                 py_req.preemption_count = rr.preemption_count
                 inst_metrics.record_finished(py_req)
                 all_metrics.record_finished(py_req)
-
-            dispatch_counts.append(len(inst_res.finished))
 
             try:
                 inst_result = inst_metrics.compute_results(

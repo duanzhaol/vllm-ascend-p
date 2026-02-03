@@ -222,6 +222,14 @@ class ClusterConfig:
     dispatch_strategy: str = "round_robin"
 
     def __post_init__(self) -> None:
+        # Validate config.
+        if not self.instances:
+            raise ValueError("ClusterConfig.instances must not be empty")
+        for i, inst in enumerate(self.instances):
+            if inst.count < 1:
+                raise ValueError(
+                    f"instances[{i}].count must be >= 1, got {inst.count}"
+                )
         # Auto-generate group_id for groups that don't have one.
         for i, inst in enumerate(self.instances):
             if not inst.group_id:

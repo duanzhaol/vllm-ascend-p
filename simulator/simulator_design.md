@@ -191,6 +191,18 @@ class ClusterConfig:
     instances: list[InstanceConfig]
     dispatch_strategy: str = "round_robin"   # round_robin | least_loaded
 
+    def __post_init__(self):
+        # 校验在 group_id 自动生成之前执行
+        if not self.instances:
+            raise ValueError("instances must not be empty")
+        for i, inst in enumerate(self.instances):
+            if inst.count < 1:
+                raise ValueError(f"instances[{i}].count must be >= 1")
+        # 自动填充空 group_id
+        for i, inst in enumerate(self.instances):
+            if not inst.group_id:
+                inst.group_id = f"group_{i}"
+
     @classmethod
     def load(cls, path: str) -> ClusterConfig:
         """根据扩展名自动选择 yaml/json"""
@@ -200,7 +212,7 @@ class ClusterConfig:
         return sum(inst.count for inst in self.instances)
 ```
 
-支持 YAML 和 JSON 两种配置格式，通过文件扩展名自动识别。
+`__post_init__` 在构造时自动执行：先校验 `instances` 非空且每组 `count >= 1`，再为缺省的 `group_id` 自动填充。支持 YAML 和 JSON 两种配置格式，通过文件扩展名自动识别。
 
 ### 4.7 ClusterResult
 
@@ -483,39 +495,57 @@ while 事件队列非空:
     event = pop 最早事件
 
     if REQUEST_ARRIVAL:
-        views = [build_view(inst) for inst in instances]
-        target = dispatcher.choose(request, views)
-        target.pending.append(request)
-        if target 空闲:
-            try_start_step(target)
+        # 批量收集同一时刻的所有 ARRIVAL 事件
+        batch = [event.data]
+        while 队列非空 and peek.time == event.time
+              and peek.type == REQUEST_ARRIVAL:
+            batch.append(pop().data)
+        batch.sort()  # 按请求索引排序，保证 Python/C++ 确定性一致
+
+        # 先全部 dispatch，再统一触发 step
+        affected = set()
+        for req_idx in batch:
+            views = [build_view(inst) for inst in instances]
+            target = dispatcher.choose(request, views)
+            target.pending.append(request)
+            dispatch_counts[target] += 1
+            if target 空闲:
+                affected.add(target)
+
+        for inst in sorted(affected):  # 按实例索引升序，保证确定性
+            try_start_step(inst)
 
     elif STEP_COMPLETE:
         instance.step_scheduled = false
         try_start_step(instance)
 ```
 
+**批量处理的意义**: 同时刻到达的多个请求在同一轮 dispatch 完毕后才触发 `try_start_step`，确保所有请求参与首次调度。若逐个处理，先到的请求会先占用 step，导致后到的同时刻请求错过首批调度，与单实例引擎行为不一致。`batch.sort()` 和 `sorted(affected)` 保证 Python 与 C++ 两端的 dispatch 顺序和 step 触发顺序完全相同。
+
 ### 9.3 try_start_step
 
-每个实例在可能有新工作时调用 `try_start_step`:
+每个实例在可能有新工作时调用 `try_start_step`。使用 `while True` 迭代循环（避免尾递归导致深 pending 队列时栈溢出）:
 
 ```
 try_start_step(instance):
-    1. 注入所有 arrival_time <= instance.clock 的 pending 请求到 scheduler
-    2. plan = scheduler.schedule()
-    3. if plan is None:
-         if scheduler.has_work():  # 死锁
-             scheduler.abort_all()
-         if pending 非空:
-             clock = 下一个 pending 的 arrival_time  # 快进
-             递归 try_start_step()
-         return  # 实例进入空闲
+    while True:
+        1. 注入所有 arrival_time <= instance.clock 的 pending 请求到 scheduler
+        2. plan = scheduler.schedule()
+        3. if plan is None:
+             if scheduler.has_work():  # 死锁
+                 scheduler.abort_all()
+             if pending 非空:
+                 clock = 下一个 pending 的 arrival_time  # 快进
+                 continue  # 重试 (迭代代替递归)
+             return  # 实例进入空闲
 
-    4. step_time = perf_model.predict_cached(B, C, A)
-    5. step_end = clock + step_time / 1000
-    6. 检测 first_token, 推进 num_computed_tokens, 记录完成
-    7. clock = step_end
-    8. push STEP_COMPLETE(step_end, instance_idx) 事件
-    9. step_scheduled = true
+        4. step_time = perf_model.predict_cached(B, C, A)
+        5. step_end = clock + step_time / 1000
+        6. 检测 first_token, 推进 num_computed_tokens, 记录完成
+        7. clock = step_end
+        8. push STEP_COMPLETE(step_end, instance_idx) 事件
+        9. step_scheduled = true
+        10. break  # step 已启动，退出循环
 ```
 
 ### 9.4 实例运行时状态
@@ -548,6 +578,8 @@ class _InstanceState:
 5. **Scheduler stall abort**: 与单实例行为一致 — 丢弃无法调度的请求。集群模式下不做跨实例重分配。
 
 6. **单实例退化**: 1 个实例的集群仿真结果与单实例引擎 (`SimulationEngine`) 完全一致 (验证通过, diff = 0)。
+
+7. **Python/C++ 确定性一致**: 同时刻 ARRIVAL 事件在 C++ `priority_queue` 中弹出顺序不稳定（同 `(time, type)` 无第三排序键）。通过批量收集后按请求池索引 `sort` 解决，无需修改 `Event` 比较运算符。`try_start_step` 调用顺序也按实例索引排序，保证两端行为完全一致。
 
 ---
 
@@ -884,6 +916,18 @@ static int cluster_dispatch(DispatchStrategy strategy,
 }
 ```
 
+返回结构:
+```cpp
+struct ClusterSimResult {
+    vector<InstanceSimResult> instance_results;  // 每实例结果
+    vector<RequestResult> all_finished;           // 所有已完成请求
+    vector<int> dispatch_counts;                  // 每实例被分配的请求数
+    int total_instances = 0;
+};
+```
+
+`dispatch_counts` 在事件循环中每次 dispatch 时累加，语义与 Python 端一致（统计"已分配"而非"已完成"的请求数）。通过 pybind11 绑定后，Python 端 `_convert_cpp_result` 直接使用该字段。
+
 入口:
 ```cpp
 ClusterSimResult run_cluster_simulation_native(
@@ -990,3 +1034,11 @@ cp _sim_core.*.so ..
 12. **异构集群**: 不同 pp/tp/max_batch 的实例组
     - 每组使用正确的 PerfPredictor (验证 group_id 正确映射)
     - 不同配置的实例展现不同的吞吐特征
+
+13. **同时刻批量调度**: 多个 `arrival_time=0.0` 的请求, 单实例集群 vs 单实例引擎
+    - 所有指标应完全一致 (实测 diff = 0), 验证批量 ARRIVAL 处理正确性
+
+14. **dispatch_counts 一致性**: Python 与 C++ 返回相同的 dispatch_counts
+    - 语义统一为"已分配"请求数, sum(dispatch_counts) == total_requests
+
+15. **配置校验**: 空 instances / count=0 时应抛出 ValueError

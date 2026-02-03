@@ -298,6 +298,7 @@ struct InstanceSimResult {
 struct ClusterSimResult {
     std::vector<InstanceSimResult> instance_results;
     std::vector<RequestResult> all_finished;
+    std::vector<int> dispatch_counts;  // per-instance dispatched request count
     int total_instances = 0;
 };
 

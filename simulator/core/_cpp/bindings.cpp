@@ -114,6 +114,8 @@ PYBIND11_MODULE(_sim_core, m) {
                       &sim::ClusterSimResult::instance_results)
         .def_readonly("all_finished",
                       &sim::ClusterSimResult::all_finished)
+        .def_readonly("dispatch_counts",
+                      &sim::ClusterSimResult::dispatch_counts)
         .def_readonly("total_instances",
                       &sim::ClusterSimResult::total_instances);
 

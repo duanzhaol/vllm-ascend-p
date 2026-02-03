@@ -1,20 +1,24 @@
 """
 生成 BCA 随机采样 YAML
 
-通过分层对数均匀采样生成 (B, C, A) 组合，导出为 YAML 格式，
+生成 (B, C, A) 组合，导出为 YAML 格式，
 供 run_benchmark_profile.py --config 直接消费。
 
 采样在每请求空间 (B, c, a) 中进行:
   c = compute_per_request, a = access_per_request
   C = B * c, A = B * a
 
-三层采样 (按有效区域 log 体积分配配额):
-  Decode:  c=1 固定,  a ∈ [1, a_max(B)]
-  Prefill: a=0 固定,  c ∈ [1, c_max(B)]
-  Chunked: c ∈ [2, c_max(B)],  a ∈ [1, a_max(B,c)]
+两种采样策略:
+
+  LHS (默认, 推荐):
+    边界样本 + 2D Latin Hypercube 在 (log-B, log-c) 空间采样。
+    LHS 保证每个 B 分层与每个 c 分层恰好配对一次，
+    从根本上解决独立采样导致 (大B, 大c) 覆盖不足的问题。
+
+  stratified (旧策略):
+    边界样本 + 三层 (decode/prefill/chunked) 体积分配 + 1D log-B 分层。
 
 所有采样上界均纳入 KV cache 容量约束。
-每层内对 log-B 做分层抽样以确保覆盖均匀。
 """
 
 import argparse
@@ -270,6 +274,143 @@ def _stratified_sample_layer(layer_name, sampler_given_B, target, rng,
     return samples
 
 
+# ---- Latin Hypercube Sampling ----
+
+def _latin_hypercube(n, ndim, rng):
+    """生成 n 个 Latin Hypercube 样本，每维度 [0,1]。
+
+    将 [0,1] 分成 n 个等宽分层，每维度的每个分层恰好出现一次。
+    保证各维度的边际分布均匀覆盖，同时避免样本聚集。
+
+    Args:
+        n: 样本数。
+        ndim: 维度数。
+        rng: random.Random 实例。
+
+    Returns:
+        list of n tuples, each of length ndim, values in [0,1].
+    """
+    perms = []
+    for _ in range(ndim):
+        p = list(range(n))
+        rng.shuffle(p)
+        perms.append(p)
+    samples = []
+    for i in range(n):
+        point = tuple((perms[d][i] + rng.random()) / n for d in range(ndim))
+        samples.append(point)
+    return samples
+
+
+def _log_quantile(u, lo, hi):
+    """将 u ∈ [0,1] 映射到 [lo, hi] 的对数均匀分位数 (整数)。"""
+    if lo >= hi:
+        return lo
+    val = math.exp(math.log(lo) + u * (math.log(hi) - math.log(lo)))
+    return max(lo, min(hi, round(val)))
+
+
+def _compute_max_gs(B, max_concurrent):
+    """计算给定 B 下的 max_group_size (divmod 调度)。"""
+    num_groups = min(max_concurrent, B)
+    base, rem = divmod(B, num_groups)
+    return base + (1 if rem > 0 else 0)
+
+
+def _generate_lhs_samples(target, rng, effective_max_seqs, max_model_len,
+                           token_budget, kv_budget, config, seen,
+                           kv_margin=0, max_concurrent=2,
+                           prefill_fraction=0.15):
+    """通过 2D LHS 在 (log-B, log-c) 空间生成 BCA 样本。
+
+    在 (log-B, log-c) 平面上做 Latin Hypercube 采样，保证
+    每个 B 分层与每个 c 分层恰好配对一次。对于每个 (B, c) 点，
+    按约束 clip c，然后 log-uniform 随机采样 a。
+
+    与旧的三层独立采样相比，LHS 保证 (大B, 大c) 等关键区域
+    一定被覆盖，从根本上消除因随机性导致 step_time 分布偏斜的问题。
+
+    Args:
+        target: 目标样本数。
+        rng: random.Random 实例。
+        effective_max_seqs: B 的最大值。
+        max_model_len: 已减去 margin 的模型长度上限。
+        token_budget: per-step token budget。
+        kv_budget: KV cache 总容量 (tokens)，可为 None。
+        config: validate_params 所需配置字典。
+        seen: 已有的 (B, C, A) key 集合，用于去重。
+        kv_margin: prompt_len 距理论上限的余量。
+        max_concurrent: 并发批次数。
+        prefill_fraction: a=0 (纯 prefill) 样本的目标比例。
+
+    Returns:
+        list of (layer_name, B, C, A) tuples.
+    """
+    # c 的全局上限 (B=1 时的理论最大值)
+    c_max_global = min(token_budget, max_model_len - 3)
+    if kv_budget is not None:
+        c_max_global = min(c_max_global, kv_budget - 2 - kv_margin)
+    c_max_global = max(1, c_max_global)
+
+    # 超采样以补偿约束裁剪 + 去重导致的丢弃
+    oversample = int(target * 1.5) + 30
+    lhs_points = _latin_hypercube(oversample, 2, rng)
+
+    samples = []
+    for u_b, u_c in lhs_points:
+        if len(samples) >= target:
+            break
+
+        # Dim 0 → B (log-uniform [1, max_seqs])
+        B = _log_quantile(u_b, 1, effective_max_seqs)
+
+        # Dim 1 → c (先映射到全局范围，再 clip 到 B 约束)
+        c = _log_quantile(u_c, 1, c_max_global)
+        max_gs = _compute_max_gs(B, max_concurrent)
+        c_max_B = min(token_budget // max_gs, max_model_len - 3)
+        if kv_budget is not None:
+            c_max_B = min(c_max_B, kv_budget // B - 2 - kv_margin)
+        if c_max_B < 1:
+            continue
+        c = max(1, min(c, c_max_B))
+        C = B * c
+
+        # a: prefill_fraction 概率取 a=0, 其余 log-uniform
+        a_max = max_model_len - c - 3
+        if kv_budget is not None:
+            a_max = min(a_max, kv_budget // B - c - 2 - kv_margin)
+
+        if a_max < 1 or rng.random() < prefill_fraction:
+            a = 0
+        else:
+            a = log_uniform_int(1, a_max, rng)
+        A = B * a
+
+        # 去重 + 验证
+        key = (B, C, A)
+        if key in seen:
+            continue
+        valid, _ = validate_params(B, C, A, config)
+        if not valid:
+            continue
+        seen.add(key)
+
+        # 按 c, a 值分类 layer
+        if c == 1 and a > 0:
+            layer = "decode"
+        elif a == 0:
+            layer = "prefill"
+        else:
+            layer = "chunked"
+        samples.append((layer, B, C, A))
+
+    if len(samples) < target:
+        print(f"Warning: LHS generated {len(samples)}/{target} samples "
+              f"after constraint filtering", file=sys.stderr)
+
+    return samples
+
+
 # ---- 边界样本 ----
 
 def _log_steps(lo, hi, n):
@@ -376,8 +517,8 @@ def generate_boundary_samples(effective_max_seqs, token_budget, max_model_len,
 def generate_random_bca_samples(num_samples, token_budget, max_num_seqs,
                                 max_model_len, kv_cache_tokens=None,
                                 max_concurrent_batches=2, seed=42,
-                                prompt_len_margin=50):
-    """主采样函数: 边界样本 + 体积比例分配 + B 分层随机采样。
+                                prompt_len_margin=50, strategy="lhs"):
+    """主采样函数: 边界样本 + 内部随机采样。
 
     Args:
         kv_cache_tokens: KV cache 总容量 (tokens)。若提供，则约束
@@ -388,6 +529,9 @@ def generate_random_bca_samples(num_samples, token_budget, max_num_seqs,
         prompt_len_margin: 每请求长度距理论上限的余量。
             采样上界为 max_model_len - prompt_len_margin，
             避免触碰极端边界。
+        strategy: 采样策略:
+            "lhs" - 边界 + 2D Latin Hypercube (推荐, 保证 B×c 网格覆盖)
+            "stratified" - 边界 + 三层体积分配 + B 分层 (旧策略)
 
     Returns:
         list of (layer_name, B, C, A) tuples
@@ -411,60 +555,71 @@ def generate_random_bca_samples(num_samples, token_budget, max_num_seqs,
     # 采样用的模型长度上限 (留 margin 余量)
     sampling_max_len = max_model_len - prompt_len_margin
 
-    # 1. 边界样本 (确保 RF 模型在边界有训练数据)
+    # 1. 边界样本 (确保模型在参数空间边界有训练数据)
     boundary_samples, seen = generate_boundary_samples(
         effective_max_seqs, token_budget, sampling_max_len, config,
         max_concurrent=max_concurrent_batches)
 
-    # 2. 按有效区域 log 体积分配配额
     remaining = max(0, num_samples - len(boundary_samples))
 
-    volumes = _estimate_layer_volumes(
-        effective_max_seqs, sampling_max_len, token_budget, kv_budget,
-        kv_margin=prompt_len_margin, max_concurrent=max_concurrent_batches)
-    total_vol = sum(volumes.values())
-
-    layer_spec = [
-        ("decode", _decode_given_B),
-        ("prefill", _prefill_given_B),
-        ("chunked", _chunked_given_B),
-    ]
-
-    # Chunked 的 3D 体积远大于 2D 层，缩减权重以平衡覆盖密度
-    weights = dict(volumes)
-    weights["chunked"] = weights.get("chunked", 0) / 2
-
-    # Largest-remainder 分配法，确保总数精确等于 remaining
-    total_weight = sum(weights.values())
-    if total_weight > 0:
-        raw = {name: remaining * weights[name] / total_weight for name in weights}
-    else:
-        raw = {name: remaining / len(layer_spec) for name in weights}
-
-    allocations = {name: max(1, int(v)) for name, v in raw.items()}
-    alloc_remainder = remaining - sum(allocations.values())
-    frac_order = sorted(raw.keys(), key=lambda n: -(raw[n] - int(raw[n])))
-    for name in frac_order:
-        if alloc_remainder <= 0:
-            break
-        allocations[name] += 1
-        alloc_remainder -= 1
-
-    # 输出分配信息
-    print(f"  layer volumes: { {k: f'{v:.1f}' for k, v in volumes.items()} }")
-    print(f"  layer allocations: {allocations} (boundary={len(boundary_samples)})")
-
-    # 3. B 分层随机采样
-    all_samples = list(boundary_samples)
-
-    for layer_name, sampler_given_B in layer_spec:
-        target = allocations.get(layer_name, 0)
-        layer_samples = _stratified_sample_layer(
-            layer_name, sampler_given_B, target, rng,
-            effective_max_seqs, sampling_max_len, token_budget,
-            kv_budget, config, seen, kv_margin=prompt_len_margin,
+    if strategy == "lhs":
+        # ---- LHS 策略: 2D Latin Hypercube in (log-B, log-c) ----
+        print(f"  strategy: LHS (2D: log-B x log-c)")
+        lhs_samples = _generate_lhs_samples(
+            remaining, rng, effective_max_seqs, sampling_max_len,
+            token_budget, kv_budget, config, seen,
+            kv_margin=prompt_len_margin,
             max_concurrent=max_concurrent_batches)
-        all_samples.extend(layer_samples)
+        all_samples = list(boundary_samples) + lhs_samples
+    else:
+        # ---- 旧策略: 三层体积分配 + B 分层随机采样 ----
+        volumes = _estimate_layer_volumes(
+            effective_max_seqs, sampling_max_len, token_budget, kv_budget,
+            kv_margin=prompt_len_margin,
+            max_concurrent=max_concurrent_batches)
+
+        layer_spec = [
+            ("decode", _decode_given_B),
+            ("prefill", _prefill_given_B),
+            ("chunked", _chunked_given_B),
+        ]
+
+        # Chunked 的 3D 体积远大于 2D 层，缩减权重以平衡覆盖密度
+        weights = dict(volumes)
+        weights["chunked"] = weights.get("chunked", 0) / 2
+
+        # Largest-remainder 分配法
+        total_weight = sum(weights.values())
+        if total_weight > 0:
+            raw = {name: remaining * weights[name] / total_weight
+                   for name in weights}
+        else:
+            raw = {name: remaining / len(layer_spec) for name in weights}
+
+        allocations = {name: max(1, int(v)) for name, v in raw.items()}
+        alloc_remainder = remaining - sum(allocations.values())
+        frac_order = sorted(raw.keys(),
+                            key=lambda n: -(raw[n] - int(raw[n])))
+        for name in frac_order:
+            if alloc_remainder <= 0:
+                break
+            allocations[name] += 1
+            alloc_remainder -= 1
+
+        print(f"  layer volumes: "
+              f"{ {k: f'{v:.1f}' for k, v in volumes.items()} }")
+        print(f"  layer allocations: {allocations} "
+              f"(boundary={len(boundary_samples)})")
+
+        all_samples = list(boundary_samples)
+        for layer_name, sampler_given_B in layer_spec:
+            target = allocations.get(layer_name, 0)
+            layer_samples = _stratified_sample_layer(
+                layer_name, sampler_given_B, target, rng,
+                effective_max_seqs, sampling_max_len, token_budget,
+                kv_budget, config, seen, kv_margin=prompt_len_margin,
+                max_concurrent=max_concurrent_batches)
+            all_samples.extend(layer_samples)
 
     return all_samples
 
@@ -611,6 +766,11 @@ Example usage:
              "Used for divmod distribution to compute per-step budget. (default: 2)",
     )
     parser.add_argument(
+        "--strategy", choices=["lhs", "stratified"], default="lhs",
+        help="Sampling strategy: 'lhs' (Latin Hypercube, recommended) "
+             "or 'stratified' (legacy 3-layer volume-based). Default: lhs.",
+    )
+    parser.add_argument(
         "-o", "--output", type=str, default="bca_workloads.yaml",
         help="Output YAML file path (default: bca_workloads.yaml)",
     )
@@ -631,6 +791,7 @@ Example usage:
         kv_cache_tokens=args.kv_cache_tokens,
         max_concurrent_batches=args.max_concurrent_batches,
         seed=args.seed,
+        strategy=args.strategy,
     )
 
     print_stats(samples)

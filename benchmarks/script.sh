@@ -23,3 +23,7 @@ VLLM_SERVER_DEV_MODE=1 VLLM_MOE_ROUTING_SIMULATION_STRATEGY=uniform_random VLLM_
 python benchmarks/run_benchmark_profile.py --config benchmarks/configs/bca_workloads.yaml --output-file results.csv
 
 python benchmarks/run_benchmark_profile.py --config benchmarks/configs/qwen-pp4.yaml --output-file benchmarks/results/qwen-pp4-2.csv
+
+
+#训练性能模型
+python -m simulator.perf_model.training --csv benchmarks/results/qwen-tp4-300-lsh.csv --model-name qwen

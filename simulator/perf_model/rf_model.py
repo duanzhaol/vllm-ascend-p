@@ -297,13 +297,12 @@ class StepPerfModel:
         def _quantize(val: int, gran: int) -> int:
             if gran <= 1:
                 return val
-            return (val // gran) * gran
+            return ((val + gran // 2) // gran) * gran
 
-        key = (
-            _quantize(batch_size, cache_granularity.get("batch_size", 1)),
-            _quantize(compute_tokens, cache_granularity.get("compute_tokens", 32)),
-            _quantize(access_tokens, cache_granularity.get("access_tokens", 1024)),
-        )
+        q_b = max(1, _quantize(batch_size, cache_granularity.get("batch_size", 1)))
+        q_c = max(1, _quantize(compute_tokens, cache_granularity.get("compute_tokens", 32)))
+        q_a = _quantize(access_tokens, cache_granularity.get("access_tokens", 1024))
+        key = (q_b, q_c, q_a)
 
         if key not in self._cache:
             self._cache[key] = self.predict(key[0], key[1], key[2])
